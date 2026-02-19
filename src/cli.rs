@@ -23,6 +23,8 @@ struct CliArgs {
     chr: Vec<String>,
     #[arg(long = "parallel")]
     nproc: Option<String>,
+    #[arg(long = "parallel-single-output", action = ArgAction::SetTrue)]
+    parallel_single_output: bool,
     #[arg(short = 'S', long = "samtools", default_value = "samtools")]
     samtools: String,
     #[arg(short = 'T', long = "tabix", default_value = "tabix")]
@@ -82,6 +84,7 @@ pub struct Bam2SeqzArgs {
     pub normal2: Option<String>,
     pub chr: Vec<String>,
     pub nproc: usize,
+    pub parallel_single_output: bool,
     pub samtools: String,
     pub tabix: String,
     pub qlimit: i32,
@@ -105,6 +108,7 @@ impl Default for Bam2SeqzArgs {
             normal2: None,
             chr: Vec::new(),
             nproc: 1,
+            parallel_single_output: false,
             samtools: "samtools".to_string(),
             tabix: "tabix".to_string(),
             qlimit: 20,
@@ -192,6 +196,7 @@ where
             .nproc
             .as_deref()
             .map_or(Ok(1), |value| parse_usize("--parallel", value))?,
+        parallel_single_output: cli.parallel_single_output,
         samtools: cli.samtools,
         tabix: cli.tabix,
         qlimit: parse_i32("-q", &cli.qlimit)?,
@@ -412,5 +417,31 @@ mod tests {
         .expect("expected parse success");
 
         assert!(args.progress);
+    }
+
+    #[test]
+    fn parses_parallel_single_output_flag() {
+        let args = parse_args([
+            "bam2seqz_rs",
+            "-n",
+            "normal.bam",
+            "-t",
+            "tumor.bam",
+            "-gc",
+            "gc.wig.gz",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr20:1-100",
+            "chr20:101-200",
+            "--parallel",
+            "2",
+            "--parallel-single-output",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        assert!(args.parallel_single_output);
     }
 }

@@ -3,6 +3,7 @@ use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
 use crate::seqz_core::{SeqzParams, do_seqz};
 use crate::writer;
+use crossbeam_channel::unbounded;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::ThreadPoolBuilder;
@@ -13,8 +14,9 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::process::Child;
+use std::sync::Arc;
 use std::time::Duration;
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,13 @@ pub struct PipelinePlan {
     pub regions: Vec<String>,
     pub output_paths: Vec<String>,
     pub qlimit_ascii: i32,
+}
+
+#[derive(Debug)]
+struct RegionChunk {
+    index: usize,
+    region: String,
+    chunk_file: NamedTempFile,
 }
 
 pub fn build_plan(args: &Bam2SeqzArgs) -> Result<PipelinePlan> {
@@ -52,8 +61,14 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
         "starting pipeline run"
     );
     let plan = build_plan(args)?;
+    let base_tools = ExternalTools::from_args(args);
+    let gc_intervals = Arc::new(load_gc_intervals_for_run(args, &base_tools)?);
 
     if args.nproc > 1 {
+        if args.parallel_single_output {
+            return run_parallel_single_output(args, gc_intervals);
+        }
+
         let work = args
             .chr
             .iter()
@@ -80,14 +95,114 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
         pool.install(|| {
             work.par_iter().try_for_each(|(region, output_path)| {
                 let tools = ExternalTools::from_args(args);
-                run_one(args, &tools, std::slice::from_ref(region), output_path)
+                run_one(
+                    args,
+                    &tools,
+                    std::slice::from_ref(region),
+                    output_path,
+                    gc_intervals.as_ref(),
+                )
             })
         })?;
     } else {
-        let tools = ExternalTools::from_args(args);
-        run_one(args, &tools, &args.chr, &args.out)?;
+        run_one(args, &base_tools, &args.chr, &args.out, gc_intervals.as_ref())?;
     }
 
+    Ok(())
+}
+
+fn run_parallel_single_output(
+    args: &Bam2SeqzArgs,
+    gc_intervals: Arc<HashMap<String, Vec<GcInterval>>>,
+) -> Result<()> {
+    let work = args
+        .chr
+        .iter()
+        .enumerate()
+        .map(|(index, region)| (index, region.clone()))
+        .collect::<Vec<_>>();
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(args.nproc)
+        .build()
+        .map_err(|err| AppError::ParseError {
+            message: format!("failed to initialize rayon thread pool: {err}"),
+        })?;
+
+    let (sender, receiver) = unbounded::<Result<RegionChunk>>();
+    pool.install(|| {
+        work.par_iter().for_each_with(sender, |tx, (index, region)| {
+            let result = (|| {
+                let tools = ExternalTools::from_args(args);
+                let chunk_file = Builder::new()
+                    .prefix("bam2seqz_rs_parallel_chunk_")
+                    .suffix(".seqz")
+                    .tempfile_in("tmp")?;
+                let chunk_path = chunk_file.path().to_string_lossy().into_owned();
+                run_one(
+                    args,
+                    &tools,
+                    std::slice::from_ref(region),
+                    &chunk_path,
+                    gc_intervals.as_ref(),
+                )?;
+                Ok(RegionChunk {
+                    index: *index,
+                    region: region.clone(),
+                    chunk_file,
+                })
+            })();
+            let _ = tx.send(result);
+        });
+    });
+
+    let mut chunks: Vec<Option<RegionChunk>> = (0..work.len()).map(|_| None).collect();
+    for _ in 0..work.len() {
+        let region_chunk = receiver.recv().map_err(|err| AppError::ParseError {
+            message: format!("failed to receive parallel region result: {err}"),
+        })??;
+        let index = region_chunk.index;
+        chunks[index] = Some(region_chunk);
+    }
+
+    let tools = ExternalTools::from_args(args);
+    writer::with_text_output_writer(&args.out, &tools, |out| {
+        writer::write_seqz_header(out)?;
+
+        for (index, maybe_chunk) in chunks.into_iter().enumerate() {
+            let chunk = maybe_chunk.ok_or_else(|| AppError::ParseError {
+                message: format!("missing region chunk result for index {index}"),
+            })?;
+            info!(
+                region = %chunk.region,
+                chunk = %chunk.chunk_file.path().to_string_lossy(),
+                "merging ordered region chunk"
+            );
+
+            let mut reader = BufReader::new(chunk.chunk_file.reopen()?);
+            let mut line = String::new();
+            let mut skip_header = true;
+            loop {
+                line.clear();
+                let read = reader.read_line(&mut line)?;
+                if read == 0 {
+                    break;
+                }
+                if skip_header {
+                    skip_header = false;
+                    continue;
+                }
+                out.write_all(line.as_bytes())?;
+            }
+        }
+        Ok(())
+    })?;
+
+    if args.out.ends_with(".gz") {
+        info!(output = %args.out, "indexing compressed seqz with tabix");
+        tools.tabix_index_seqz(&args.out)?;
+    }
+    info!(output = %args.out, "completed parallel single-output merge");
     Ok(())
 }
 
@@ -96,6 +211,7 @@ fn run_one(
     tools: &ExternalTools,
     regions: &[String],
     output: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
 ) -> Result<()> {
     info!(
         output = %output,
@@ -103,39 +219,10 @@ fn run_one(
         pileup_mode = args.pileup,
         "starting region pipeline"
     );
-    let mut gc_filter: HashSet<String> = HashSet::new();
-    if !regions.is_empty() {
-        gc_filter.extend(
-            regions
-                .iter()
-                .map(|region| region_chromosome(region).to_string()),
-        );
-    } else if !args.pileup {
-        gc_filter.extend(tools.list_bam_chromosomes(&args.tumor)?);
-        if let Some(normal2_path) = &args.normal2 {
-            gc_filter.extend(tools.list_bam_chromosomes(normal2_path)?);
-        }
-    }
-
-    let gc_intervals = parse_gc_intervals_from_file(
-        &args.gc,
-        if gc_filter.is_empty() {
-            None
-        } else {
-            Some(&gc_filter)
-        },
-    )?;
-    let gc_interval_count = gc_intervals.values().map(Vec::len).sum::<usize>();
-    info!(
-        chromosomes = gc_intervals.len(),
-        intervals = gc_interval_count,
-        "loaded gc intervals"
-    );
-
     let effective_regions = if regions.is_empty() {
         Vec::new()
     } else {
-        filter_regions_with_gc(regions, &gc_intervals)
+        filter_regions_with_gc(regions, gc_intervals)
     };
 
     if !regions.is_empty() {
@@ -215,7 +302,7 @@ fn run_one(
                 continue;
             }
 
-            let Some(gc) = gc_value_at(&gc_intervals, &normal.chromosome, normal.position) else {
+            let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
                 continue;
             };
 
@@ -377,7 +464,7 @@ fn open_pileup_stream(
 
 struct PileupStream {
     reader: Box<dyn BufRead>,
-    line_buffer: String,
+    line_buffer: Vec<u8>,
     _tempfile: Option<NamedTempFile>,
     process: Option<StreamProcess>,
     region_source: Option<RegionStreamSource>,
@@ -437,7 +524,7 @@ impl PileupStream {
             let decoder = GzDecoder::new(file);
             Ok(Self {
                 reader: Box::new(BufReader::new(decoder)),
-                line_buffer: String::new(),
+                line_buffer: Vec::with_capacity(256),
                 _tempfile: None,
                 process: None,
                 region_source: None,
@@ -446,7 +533,7 @@ impl PileupStream {
             let file = File::open(path)?;
             Ok(Self {
                 reader: Box::new(BufReader::new(file)),
-                line_buffer: String::new(),
+                line_buffer: Vec::with_capacity(256),
                 _tempfile: None,
                 process: None,
                 region_source: None,
@@ -458,7 +545,7 @@ impl PileupStream {
         let reader_file = tempfile.reopen()?;
         Ok(Self {
             reader: Box::new(BufReader::new(reader_file)),
-            line_buffer: String::new(),
+            line_buffer: Vec::with_capacity(256),
             _tempfile: Some(tempfile),
             process: None,
             region_source: None,
@@ -495,7 +582,7 @@ impl PileupStream {
         };
         Ok(Self {
             reader: Box::new(BufReader::new(stream.stdout)),
-            line_buffer: String::new(),
+            line_buffer: Vec::with_capacity(256),
             _tempfile: None,
             process: Some(process),
             region_source: None,
@@ -548,7 +635,7 @@ impl PileupStream {
     fn next_record(&mut self) -> Result<Option<PileupRecord>> {
         loop {
             self.line_buffer.clear();
-            let read = self.reader.read_line(&mut self.line_buffer)?;
+            let read = self.reader.read_until(b'\n', &mut self.line_buffer)?;
             if read == 0 {
                 self.ensure_process_completed()?;
                 if self.advance_region_stream()? {
@@ -556,8 +643,8 @@ impl PileupStream {
                 }
                 return Ok(None);
             }
-            let line = self.line_buffer.trim_end_matches(['\n', '\r']);
-            if line.trim().is_empty() {
+            let line = trim_line_end(&self.line_buffer);
+            if line.is_empty() || line.iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
             return parse_pileup_record(line).map(Some);
@@ -613,28 +700,31 @@ impl PileupRecord {
     }
 }
 
-fn parse_pileup_record(line: &str) -> Result<PileupRecord> {
-    let parts = line.splitn(6, '\t').collect::<Vec<_>>();
+fn parse_pileup_record(line: &[u8]) -> Result<PileupRecord> {
+    let parts = line.splitn(6, |byte| *byte == b'\t').collect::<Vec<_>>();
     if parts.len() < 6 {
         return Err(AppError::ParseError {
-            message: format!("invalid pileup line: {line}"),
+            message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
         });
     }
 
-    let position = parts[1].parse::<i32>().map_err(|_| AppError::ParseError {
-        message: format!("invalid pileup position: {}", parts[1]),
+    let position = parse_i32_ascii(parts[1]).ok_or_else(|| AppError::ParseError {
+        message: format!(
+            "invalid pileup position: {}",
+            String::from_utf8_lossy(parts[1])
+        ),
     })?;
-    let depth = parts[3].parse::<i32>().map_err(|_| AppError::ParseError {
-        message: format!("invalid pileup depth: {}", parts[3]),
+    let depth = parse_i32_ascii(parts[3]).ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup depth: {}", String::from_utf8_lossy(parts[3])),
     })?;
 
     Ok(PileupRecord {
-        chromosome: parts[0].to_string(),
+        chromosome: String::from_utf8_lossy(parts[0]).into_owned(),
         position,
-        reference: parts[2].to_string(),
+        reference: String::from_utf8_lossy(parts[2]).into_owned(),
         depth,
-        pileup: parts[4].to_string(),
-        quality: parts[5].to_string(),
+        pileup: String::from_utf8_lossy(parts[4]).into_owned(),
+        quality: String::from_utf8_lossy(parts[5]).into_owned(),
     })
 }
 
@@ -720,26 +810,21 @@ fn parse_gc_intervals_from_reader<R: BufRead>(
     let mut keep_current = false;
     let mut map: HashMap<String, Vec<GcInterval>> = HashMap::new();
 
-    let mut buf = String::new();
+    let mut buf = Vec::with_capacity(128);
     loop {
         buf.clear();
-        let read = reader.read_line(&mut buf)?;
+        let read = reader.read_until(b'\n', &mut buf)?;
         if read == 0 {
             break;
         }
 
-        let line = buf.trim_end_matches(['\n', '\r']);
-        if line.starts_with("variableStep") {
-            let mut chromosome = None;
-            let mut span = None;
-            for token in line.split_whitespace() {
-                if let Some(value) = token.strip_prefix("chrom=") {
-                    chromosome = Some(value.to_string());
-                }
-                if let Some(value) = token.strip_prefix("span=") {
-                    span = value.parse::<i32>().ok();
-                }
-            }
+        let line = trim_line_end(&buf);
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with(b"variableStep") {
+            let (chromosome, span) = parse_variable_step_header(line);
             current_chromosome = chromosome;
             current_span = span.unwrap_or(0);
             keep_current = current_chromosome
@@ -755,24 +840,95 @@ fn parse_gc_intervals_from_reader<R: BufRead>(
         let Some(chromosome) = &current_chromosome else {
             continue;
         };
-        let mut fields = line.split_whitespace();
-        let Some(start_str) = fields.next() else {
-            continue;
-        };
-        let Some(gc) = fields.next() else {
-            continue;
-        };
-        let Some(start) = start_str.parse::<i32>().ok() else {
+        let Some((start, gc)) = parse_gc_data_line(line) else {
             continue;
         };
 
         map.entry(chromosome.clone()).or_default().push(GcInterval {
             start,
             end: start + current_span,
-            gc: gc.to_string(),
+            gc,
         });
     }
     Ok(map)
+}
+
+fn load_gc_intervals_for_run(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+) -> Result<HashMap<String, Vec<GcInterval>>> {
+    let mut gc_filter: HashSet<String> = HashSet::new();
+    if !args.chr.is_empty() {
+        gc_filter.extend(args.chr.iter().map(|region| region_chromosome(region).to_string()));
+    } else if !args.pileup {
+        gc_filter.extend(tools.list_bam_chromosomes(&args.tumor)?);
+        if let Some(normal2_path) = &args.normal2 {
+            gc_filter.extend(tools.list_bam_chromosomes(normal2_path)?);
+        }
+    }
+
+    let gc_intervals = parse_gc_intervals_from_file(
+        &args.gc,
+        if gc_filter.is_empty() {
+            None
+        } else {
+            Some(&gc_filter)
+        },
+    )?;
+    let gc_interval_count = gc_intervals.values().map(Vec::len).sum::<usize>();
+    info!(
+        chromosomes = gc_intervals.len(),
+        intervals = gc_interval_count,
+        "loaded gc intervals"
+    );
+    Ok(gc_intervals)
+}
+
+fn trim_line_end(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 {
+        let value = line[end - 1];
+        if value == b'\n' || value == b'\r' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &line[..end]
+}
+
+fn parse_variable_step_header(line: &[u8]) -> (Option<String>, Option<i32>) {
+    let mut chromosome = None;
+    let mut span = None;
+
+    for token in line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
+    {
+        if let Some(value) = token.strip_prefix(b"chrom=") {
+            chromosome = Some(String::from_utf8_lossy(value).into_owned());
+        }
+        if let Some(value) = token.strip_prefix(b"span=") {
+            span = parse_i32_ascii(value);
+        }
+    }
+
+    (chromosome, span)
+}
+
+fn parse_gc_data_line(line: &[u8]) -> Option<(i32, String)> {
+    let mut fields = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty());
+    let start = parse_i32_ascii(fields.next()?)?;
+    let gc = String::from_utf8_lossy(fields.next()?).into_owned();
+    Some((start, gc))
+}
+
+fn parse_i32_ascii(bytes: &[u8]) -> Option<i32> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
 }
 
 #[cfg(test)]

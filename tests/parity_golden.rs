@@ -262,6 +262,51 @@ fn rust_matches_golden_parallel_regions() {
 }
 
 #[test]
+fn rust_parallel_single_output_preserves_region_order() {
+    let out = workspace_dir().join("target").join("it_parallel_single.seqz.gz");
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(tabix_index_path(&out));
+
+    let run = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "-C",
+        REGION_A,
+        REGION_B,
+        "--parallel",
+        "2",
+        "--parallel-single-output",
+        "-o",
+        "target/it_parallel_single.seqz.gz",
+    ]);
+    assert!(
+        run.status.success(),
+        "parallel single-output run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_output_and_index_exist(&out);
+
+    let actual = gunzip_to_text(&out);
+    let expected_a =
+        fs::read_to_string(golden_dir().join("bam_parallel_7.seqz")).expect("golden parallel 7");
+    let expected_b = fs::read_to_string(golden_dir().join("bam_parallel_12.seqz"))
+        .expect("golden parallel 12");
+    let expected_b_body = expected_b
+        .split_once('\n')
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    let expected = format!("{expected_a}{expected_b_body}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn rust_matches_golden_normal2() {
     let normal2_out = workspace_dir().join("target").join("it_normal2.seqz.gz");
     let _ = fs::remove_file(&normal2_out);

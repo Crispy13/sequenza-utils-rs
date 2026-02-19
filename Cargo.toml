@@ -10,6 +10,7 @@ tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 rayon = "1"
+crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
