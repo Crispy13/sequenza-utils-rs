@@ -1,0 +1,29 @@
+[package]
+name = "bam2seqz_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2"
+flate2 = "1"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = 'thin'
+debug = "line-tables-only"
+
+[profile.debug-release]
+inherits = "release"
+debug = true
+
+[profile.deploy]
+inherits = "release"
+lto = true
+codegen-units = 1
+debug = false

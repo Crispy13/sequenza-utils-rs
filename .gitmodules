@@ -1,0 +1,3 @@
+[submodule "sequenza-utils"]
+	path = sequenza-utils
+	url = https://bitbucket.org/sequenzatools/sequenza-utils.git

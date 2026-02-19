@@ -1,0 +1,11 @@
+/target
+tmp/
+testdata/
+
+
+copilot-current-plan.md
+copilot-desk/
+copilot-project-plan.md
+chatlog_260218.md
+.vscode/
+.github/
