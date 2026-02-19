@@ -343,6 +343,71 @@ fn rust_parallel_auto_binning_matches_golden_bam_default_single_output() {
 }
 
 #[test]
+fn rust_parallel_auto_binning_contig_duplicates_are_deterministic() {
+    let out_dup = workspace_dir()
+        .join("target")
+        .join("it_parallel_auto_chr20_dup.seqz.gz");
+    let out_single = workspace_dir()
+        .join("target")
+        .join("it_parallel_auto_chr20_single.seqz.gz");
+
+    for path in [&out_dup, &out_single] {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(tabix_index_path(path));
+    }
+
+    let run_dup = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "-C",
+        "chr20",
+        "chr20",
+        "--parallel",
+        "2",
+        "-o",
+        "target/it_parallel_auto_chr20_dup.seqz.gz",
+    ]);
+    assert!(
+        run_dup.status.success(),
+        "parallel auto-binning duplicate-contig run failed: {}",
+        String::from_utf8_lossy(&run_dup.stderr)
+    );
+
+    let run_single = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "-C",
+        "chr20",
+        "--parallel",
+        "2",
+        "-o",
+        "target/it_parallel_auto_chr20_single.seqz.gz",
+    ]);
+    assert!(
+        run_single.status.success(),
+        "parallel auto-binning single-contig run failed: {}",
+        String::from_utf8_lossy(&run_single.stderr)
+    );
+
+    assert_output_and_index_exist(&out_dup);
+    assert_output_and_index_exist(&out_single);
+
+    assert_eq!(gunzip_to_text(&out_dup), gunzip_to_text(&out_single));
+}
+
+#[test]
 fn rust_matches_golden_normal2() {
     let normal2_out = workspace_dir().join("target").join("it_normal2.seqz.gz");
     let _ = fs::remove_file(&normal2_out);

@@ -1305,4 +1305,26 @@ mod tests {
             vec!["chr2:1-5000000".to_string(), "chr1:1-5000000".to_string()]
         );
     }
+
+    #[test]
+    fn dedup_chromosomes_preserves_first_seen_order() {
+        let chromosomes = vec![
+            "chr20".to_string(),
+            "chr20".to_string(),
+            "chr21".to_string(),
+            "chr20".to_string(),
+            "chr1".to_string(),
+            "chr21".to_string(),
+        ];
+
+        let deduped = super::dedup_chromosomes_preserving_order(&chromosomes);
+        assert_eq!(
+            deduped,
+            vec![
+                "chr20".to_string(),
+                "chr21".to_string(),
+                "chr1".to_string(),
+            ]
+        );
+    }
 }
