@@ -22,16 +22,6 @@ Rust implementation of `sequenza-utils` `bam2seqz` with parity-first behavior ag
   - Normal BAM: `testdata/NA12878.chrom20.synthetic.seed20260218.normal.chr.bam`
   - Tumor BAM: `testdata/NA12878.chrom20.synthetic.seed20260218.tumor.chr.bam`
 
-## FAQ: what is `bam_default` test?
-
-`bam_default` means a BAM-input run without explicit region arguments (`-C`) and without forcing parallel options. In other words, it is the default whole-input behavior:
-
-- command shape: `bam2seqz -n <normal.bam> -t <tumor.bam> -gc <gc.wig.gz> -F <ref.fa> -o <out>`
-- backend defaults to `samtools` unless `--bam-backend rust-htslib` is set
-- output includes all loci emitted by the active backend and downstream seqz filters
-
-This is the baseline scenario used to compare end-to-end behavior and cost against region-specific and parallel scenarios.
-
 ## Benchmark artifacts
 
 - Main benchmark (Python vs Rust):
