@@ -201,7 +201,7 @@ where
 {
     let mut tokens: Vec<String> = args.into_iter().map(Into::into).collect();
     if tokens.is_empty() {
-        tokens.push("bam2seqz_rs".to_string());
+        tokens.push("bam2seqz".to_string());
     }
 
     let normalized = normalize_legacy_tokens(tokens);
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn parses_minimal_bam_arguments() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn parses_pileup_without_fasta() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "--pileup",
             "-n",
             "normal.pileup.gz",
@@ -357,14 +357,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_fasta_for_bam_input() {
-        let result = parse_args(["bam2seqz_rs", "-n", "n.bam", "-t", "t.bam", "-gc", "gc.wig"]);
+        let result = parse_args(["bam2seqz", "-n", "n.bam", "-t", "t.bam", "-gc", "gc.wig"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_parallel_stdout() {
         let result = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "n.bam",
             "-t",
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn parses_quality_format_illumina() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn parses_legacy_normal2_flag() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn parses_progress_flag() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn parses_parallel_single_output_flag() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn accepts_parallel_without_chromosome_for_bam_input() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn rejects_single_ranged_region_with_parallel() {
         let result = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn parses_experimental_rust_htslib_backend() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "normal.bam",
             "-t",
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn rejects_backend_selection_for_pileup_mode() {
         let result = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "--pileup",
             "-n",
             "normal.pileup.gz",

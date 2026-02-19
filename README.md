@@ -1,6 +1,6 @@
-# bam2seqz_rs (v0.1)
+# sequenza-utils-rs / bam2seqz (v0.1)
 
-Rust implementation of `bam2seqz` with parity-first behavior against `sequenza-utils` and an experimental BAM backend switch.
+Rust implementation of `sequenza-utils` `bam2seqz` with parity-first behavior against Python `sequenza-utils` and an experimental BAM backend switch.
 
 ## Version 0.1 scope
 
@@ -26,7 +26,7 @@ Rust implementation of `bam2seqz` with parity-first behavior against `sequenza-u
 
 `bam_default` means a BAM-input run without explicit region arguments (`-C`) and without forcing parallel options. In other words, it is the default whole-input behavior:
 
-- command shape: `bam2seqz_rs -n <normal.bam> -t <tumor.bam> -gc <gc.wig.gz> -F <ref.fa> -o <out>`
+- command shape: `bam2seqz -n <normal.bam> -t <tumor.bam> -gc <gc.wig.gz> -F <ref.fa> -o <out>`
 - backend defaults to `samtools` unless `--bam-backend rust-htslib` is set
 - output includes all loci emitted by the active backend and downstream seqz filters
 
@@ -34,16 +34,34 @@ This is the baseline scenario used to compare end-to-end behavior and cost again
 
 ## Benchmark artifacts
 
-- Focused auto-binned p8 backend comparison (3 runs):
-  - script: `scripts/benchmark_backend_binning_p8.sh`
-  - outputs: `tmp/backend_bench_p8/{summary.tsv,details.tsv,comparison.txt}`
-- Full BAM backend matrix (scenario coverage):
-  - script: `scripts/benchmark_bam_backend_matrix.sh`
-  - outputs: `tmp/backend_bam_matrix/{summary.tsv,details.tsv,comparison.tsv,correctness.tsv}`
+- Main benchmark (Python vs Rust):
+  - artifact: `tmp/parity_resource_metrics_parallel8.tsv`
+  - scenarios: `bam_default`, `pileup_default`, `region_12`, `parallel_regions_p8`, `normal2`, and error-semantic checks
+- Extra backend benchmark (rust-htslib vs mpileup/samtools):
+  - focused p8 auto-bin script: `scripts/benchmark_backend_binning_p8.sh`
+  - focused outputs: `tmp/backend_bench_p8/{summary.tsv,details.tsv,comparison.txt}`
+  - full matrix script: `scripts/benchmark_bam_backend_matrix.sh`
+  - full matrix outputs: `tmp/backend_bam_matrix/{summary.tsv,details.tsv,comparison.tsv,correctness.tsv}`
 
 ## Benchmark results
 
-### 1) Auto-binning backend comparison (`--parallel 8`, 3 runs)
+### 1) Main benchmark: Python vs Rust (parallel-8 benchmark batch)
+
+Source: `tmp/parity_resource_metrics_parallel8.tsv`
+
+| scenario | Python elapsed | Rust elapsed | Notes |
+|---|---:|---:|---|
+| bam_default | 2:52.66 | 0:47.15 | Default BAM-input baseline |
+| pileup_default | 0:28.71 | 0:08.23 | Pileup-input mode |
+| region_12 | 0:27.79 | 0:01.72 | Single explicit region |
+| parallel_regions_p8 | 0:44.58 | 0:01.85 | 8 explicit regions, `--parallel 8` |
+| normal2 | 3:29.10 | 1:10.51 | BAM with `--normal2` |
+
+This is the primary benchmark section for v0.1 release messaging.
+
+### 2) Extra benchmark: rust-htslib vs mpileup/samtools backend comparison
+
+#### 2.1 Auto-binning backend comparison (`--parallel 8`, 3 runs)
 
 Source: `tmp/backend_bench_p8/summary.tsv`
 
@@ -56,7 +74,7 @@ Observed ratio from `tmp/backend_bench_p8/comparison.txt`:
 
 - `speedup_ratio_samtools_over_rust_htslib=1.083` (this means rust-htslib is faster on this scenario, with higher RSS).
 
-### 2) Full BAM scenario matrix (latest run)
+#### 2.2 Full BAM scenario matrix (latest run)
 
 Source: `tmp/backend_bam_matrix/comparison.tsv`
 
@@ -72,6 +90,8 @@ Source: `tmp/backend_bam_matrix/comparison.tsv`
 
 ## Interpretation notes
 
+- Main release benchmark remains Rust vs Python parity scenarios (`tmp/parity_resource_metrics_parallel8.tsv`).
+- Backend comparison (`samtools` vs `rust-htslib`) is an extra section for implementation evaluation.
 - Runtime is mixed by scenario: rust-htslib is faster in some parallel/auto-bin scenarios and slower in others.
 - Memory is consistently higher with rust-htslib in current implementation.
 - Semantics checks in `tmp/backend_bam_matrix/correctness.tsv` show:

@@ -56,7 +56,7 @@ mod tests {
             .to_string();
 
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "--pileup",
             "-n",
             &normal,

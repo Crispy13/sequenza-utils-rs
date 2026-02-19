@@ -113,7 +113,7 @@ run_case() {
   local stderr_file="$DETAIL_DIR/${scenario}.${backend}.r${rep}.stderr.txt"
 
   /usr/bin/time -v -o "$time_file" \
-    target/debug-release/bam2seqz_rs \
+        target/debug-release/bam2seqz \
     -n "$NORMAL" -t "$TUMOR" -gc "$GC" -F "$FASTA" \
     -S "$SAMTOOLS" -T "$TABIX" --bam-backend "$backend" \
     "$@" -o "$out_base" \
@@ -122,8 +122,8 @@ run_case() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$scenario" "$kind" "$backend" "$rep" "$out_base" >> "$OUT_DIR/runs.tsv"
 }
 
-echo "[build] compiling bam2seqz_rs with htslib-prototype feature"
-conda run -n rust_build_env cargo build --profile debug-release --features htslib-prototype --bin bam2seqz_rs
+echo "[build] compiling bam2seqz with htslib-prototype feature"
+conda run -n rust_build_env cargo build --profile debug-release --features htslib-prototype --bin bam2seqz
 
 for rep in $(seq 1 "$RUNS"); do
   for backend in samtools rust-htslib; do

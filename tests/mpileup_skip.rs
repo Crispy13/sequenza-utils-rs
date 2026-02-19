@@ -1,4 +1,4 @@
-use bam2seqz_rs::seqz_core::seqz_header;
+use sequenza_utils::seqz_core::seqz_header;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +16,11 @@ fn workspace_dir() -> PathBuf {
 }
 
 fn run_binary(args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bam2seqz_rs"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bam2seqz"));
     command.args(args).current_dir(workspace_dir());
     command
         .output()
-        .expect("expected bam2seqz_rs binary to execute")
+        .expect("expected bam2seqz binary to execute")
 }
 
 fn expected_header() -> String {

@@ -196,7 +196,7 @@ impl ExternalTools {
         }
 
         let temp = Builder::new()
-            .prefix("bam2seqz_rs_cmd_")
+            .prefix("bam2seqz_cmd_")
             .suffix(".txt")
             .tempfile_in("tmp")?;
 
@@ -245,7 +245,7 @@ impl ExternalTools {
         region: Option<&str>,
     ) -> Result<CommandStream> {
         let stderr_capture = Builder::new()
-            .prefix("bam2seqz_rs_cmd_stderr_")
+            .prefix("bam2seqz_cmd_stderr_")
             .suffix(".log")
             .tempfile_in("tmp")?;
         let stderr_file = stderr_capture.reopen()?;
@@ -367,7 +367,7 @@ impl ExternalTools {
         command_name: &str,
     ) -> Result<NamedTempFile> {
         let stdout_temp = Builder::new()
-            .prefix("bam2seqz_rs_cmd_")
+            .prefix("bam2seqz_cmd_")
             .suffix(".txt")
             .tempfile_in("tmp")?;
         let stdout_file = stdout_temp.reopen()?;
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn builds_mpileup_command_with_regions() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "n.bam",
             "-t",

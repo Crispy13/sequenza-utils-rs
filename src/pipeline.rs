@@ -231,7 +231,7 @@ fn run_parallel_single_output(
                         |context, (index, region)| -> Result<RegionChunk> {
                             let tools = ExternalTools::from_args(args);
                             let chunk_file = Builder::new()
-                                .prefix("bam2seqz_rs_parallel_chunk_")
+                                .prefix("bam2seqz_parallel_chunk_")
                                 .suffix(".seqz")
                                 .tempfile_in("tmp")?;
                             let chunk_path = chunk_file.path().to_string_lossy().into_owned();
@@ -276,7 +276,7 @@ fn run_parallel_single_output(
                 let result = (|| {
                     let tools = ExternalTools::from_args(args);
                     let chunk_file = Builder::new()
-                        .prefix("bam2seqz_rs_parallel_chunk_")
+                        .prefix("bam2seqz_parallel_chunk_")
                         .suffix(".seqz")
                         .tempfile_in("tmp")?;
                     let chunk_path = chunk_file.path().to_string_lossy().into_owned();
@@ -1513,7 +1513,7 @@ mod tests {
     #[test]
     fn build_plan_for_parallel_outputs() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "n.bam",
             "-t",
@@ -1545,7 +1545,7 @@ mod tests {
     #[test]
     fn build_plan_sets_ascii_quality_threshold() {
         let args = parse_args([
-            "bam2seqz_rs",
+            "bam2seqz",
             "-n",
             "n.bam",
             "-t",

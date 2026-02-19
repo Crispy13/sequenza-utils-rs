@@ -1,7 +1,9 @@
 [package]
-name = "bam2seqz_rs"
+name = "sequenza-utils"
 version = "0.1.0"
 edition = "2024"
+default-run = "bam2seqz"
+autobins = false
 
 [dependencies]
 thiserror = "2"
@@ -19,6 +21,18 @@ bio = { version = "2", optional = true }
 [features]
 default = []
 htslib-prototype = ["dep:rust-htslib", "dep:bio"]
+
+[lib]
+name = "sequenza_utils"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bam2seqz"
+path = "src/bin/bam2seqz.rs"
+
+[[bin]]
+name = "synthetic_bam_fixture"
+path = "src/bin/synthetic_bam_fixture.rs"
 
 [[bin]]
 name = "htslib_thread_local_bench"

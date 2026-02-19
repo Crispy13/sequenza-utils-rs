@@ -16,17 +16,17 @@ RUNS=3
 OUT_DIR="tmp/backend_bench_p8"
 mkdir -p "$OUT_DIR"
 
-conda run -n rust_build_env cargo build --profile debug-release --features htslib-prototype --bin bam2seqz_rs
+conda run -n rust_build_env cargo build --profile debug-release --features htslib-prototype --bin bam2seqz
 
 for i in $(seq 1 "$RUNS"); do
   /usr/bin/time -v -o "$OUT_DIR/samtools_run_${i}.time.txt" \
-    target/debug-release/bam2seqz_rs \
+    target/debug-release/bam2seqz \
     -n "$NORMAL" -t "$TUMOR" -gc "$GC" -F "$FASTA" \
     --parallel 8 -S "$SAMTOOLS" -T "$TABIX" \
     -o "$OUT_DIR/samtools_run_${i}.seqz"
 
   /usr/bin/time -v -o "$OUT_DIR/rust_htslib_run_${i}.time.txt" \
-    target/debug-release/bam2seqz_rs \
+    target/debug-release/bam2seqz \
     -n "$NORMAL" -t "$TUMOR" -gc "$GC" -F "$FASTA" \
     --parallel 8 --bam-backend rust-htslib \
     -o "$OUT_DIR/rust_htslib_run_${i}.seqz"

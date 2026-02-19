@@ -31,7 +31,7 @@ where
         let output_path = Path::new(path);
         let parent_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
         let mut plain_file = Builder::new()
-            .prefix("bam2seqz_rs_")
+            .prefix("bam2seqz_")
             .suffix(".tmp_plain")
             .tempfile_in(parent_dir)?;
 

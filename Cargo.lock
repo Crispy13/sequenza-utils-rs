@@ -89,23 +89,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bam2seqz_rs"
-version = "0.1.0"
-dependencies = [
- "bio",
- "clap",
- "crossbeam-channel",
- "flate2",
- "indicatif",
- "rayon",
- "rust-htslib",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,6 +1430,23 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+
+[[package]]
+name = "sequenza-utils"
+version = "0.1.0"
+dependencies = [
+ "bio",
+ "clap",
+ "crossbeam-channel",
+ "flate2",
+ "indicatif",
+ "rayon",
+ "rust-htslib",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "serde"

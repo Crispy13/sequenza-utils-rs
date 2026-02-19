@@ -1,4 +1,4 @@
-use bam2seqz_rs::errors::{AppError, Result};
+use sequenza_utils::errors::{AppError, Result};
 use clap::{ArgAction, Parser};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
