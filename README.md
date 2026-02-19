@@ -11,6 +11,53 @@ Rust implementation of `sequenza-utils` `bam2seqz` with parity-first behavior ag
   - ordered region-parallel single-output (`--parallel-single-output`),
   - auto-binning for BAM mode when using `--parallel` without explicit ranged regions.
 
+## Quick start
+
+### Prerequisites
+
+- Conda environment: `rust_build_env`
+- Tools in `PATH`: `samtools`, `tabix`, `bgzip`
+- Python module path for upstream reference command:
+
+```bash
+export PYTHONPATH="/home/eck/workspace/bam2seqz_rs/sequenza-utils:$PYTHONPATH"
+```
+
+### Build
+
+```bash
+conda run -n rust_build_env cargo build --profile debug-release --bin bam2seqz
+```
+
+### Run (BAM mode)
+
+```bash
+target/debug-release/bam2seqz \
+  -n testdata/NA12878.chrom20.synthetic.seed20260218.normal.chr.bam \
+  -t testdata/NA12878.chrom20.synthetic.seed20260218.tumor.chr.bam \
+  -gc testdata/hg19_gc50.wig.gz \
+  -F testdata/hg19.fa \
+  -o tmp/example.seqz.gz
+```
+
+### Run (pileup mode)
+
+```bash
+target/debug-release/bam2seqz \
+  --pileup \
+  -n testdata/NA12878.chrom20.synthetic.seed20260218.normal.region59900_64000.pileup.gz \
+  -t testdata/NA12878.chrom20.synthetic.seed20260218.tumor.region59900_64000.pileup.gz \
+  -gc testdata/hg19_gc50.wig.gz \
+  -o tmp/example_pileup.seqz.gz
+```
+
+## Runtime behavior notes
+
+- Default BAM backend is compatibility mode (`samtools mpileup` + `tabix`).
+- Experimental backend is opt-in: `--bam-backend rust-htslib` (requires `htslib-prototype`).
+- In Rust, `--parallel` with BAM input and no explicit ranged `-C` enables auto-binning with single merged output.
+- In Python upstream `sequenza-utils`, `--parallel` requires at least two explicit `-C` values; auto-binning single-output is not available.
+
 ## Build and runtime settings used for benchmarks
 
 - Rust profile: `debug-release`.
@@ -25,8 +72,9 @@ Rust implementation of `sequenza-utils` `bam2seqz` with parity-first behavior ag
 ## Benchmark artifacts
 
 - Main benchmark (Python vs Rust):
+  - reproduction script: `scripts/benchmark_python_rust_parallel8.sh`
   - artifact: `tmp/parity_resource_metrics_parallel8.tsv`
-  - scenarios: `bam_default`, `pileup_default`, `region_12`, `parallel_regions_p8`, `normal2`, and error-semantic checks
+  - scenarios: `bam_default`, `pileup_default`, `region_12`, `parallel_regions_p8`, `auto_bin_single_output_p8`, `normal2`, and error-semantic checks
 - Extra backend benchmark (rust-htslib vs mpileup/samtools):
   - focused p8 auto-bin script: `scripts/benchmark_backend_binning_p8.sh`
   - focused outputs: `tmp/backend_bench_p8/{summary.tsv,details.tsv,comparison.txt}`
@@ -41,11 +89,12 @@ Source: `tmp/parity_resource_metrics_parallel8.tsv`
 
 | scenario | Python elapsed | Rust elapsed | Notes |
 |---|---:|---:|---|
-| bam_default | 2:52.66 | 0:47.15 | Default BAM-input baseline |
-| pileup_default | 0:28.71 | 0:08.23 | Pileup-input mode |
-| region_12 | 0:27.79 | 0:01.72 | Single explicit region |
-| parallel_regions_p8 | 0:44.58 | 0:01.85 | 8 explicit regions, `--parallel 8` |
-| normal2 | 3:29.10 | 1:10.51 | BAM with `--normal2` |
+| bam_default | 2:25.30 | 0:46.68 | Default BAM-input baseline |
+| pileup_default | 0:27.83 | 0:08.18 | Pileup-input mode |
+| region_12 | 0:28.21 | 0:01.64 | Single explicit region |
+| parallel_regions_p8 | 0:37.29 | 0:01.77 | 8 explicit regions, `--parallel 8` |
+| auto_bin_single_output_p8 | N/A | 0:12.09 | Rust auto-binning (`--parallel 8`, no ranged `-C`, single output); Python does not support this mode |
+| normal2 | 3:20.25 | 1:05.91 | BAM with `--normal2` |
 
 This is the primary benchmark section for v0.1 release messaging.
 
