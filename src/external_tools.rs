@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use tempfile::{Builder, NamedTempFile};
+use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalTools {
@@ -266,6 +267,7 @@ impl ExternalTools {
             command.arg(bam);
             format!("{} mpileup {}", self.samtools, bam)
         };
+        info!(command = %command_label, "spawning mpileup stream");
 
         command
             .stdout(Stdio::piped())

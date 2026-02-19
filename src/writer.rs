@@ -7,7 +7,7 @@ use crate::external_tools::ExternalTools;
 use crate::seqz_core::seqz_header;
 use tempfile::Builder;
 
-pub fn write_seqz_header<W: Write>(writer: &mut W) -> Result<()> {
+pub fn write_seqz_header<W: Write + ?Sized>(writer: &mut W) -> Result<()> {
     writer.write_all(seqz_header().join("\t").as_bytes())?;
     writer.write_all(b"\n")?;
     Ok(())

@@ -1,19 +1,21 @@
 use crate::cli::Bam2SeqzArgs;
 use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
-use crate::seqz_core::{SeqzParams, do_seqz, seqz_header};
+use crate::seqz_core::{SeqzParams, do_seqz};
 use crate::writer;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::process::Child;
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
+use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelinePlan {
@@ -42,20 +44,47 @@ pub fn build_plan(args: &Bam2SeqzArgs) -> Result<PipelinePlan> {
 }
 
 pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
+    info!(
+        pileup = args.pileup,
+        regions = args.chr.len(),
+        parallel = args.nproc,
+        output = %args.out,
+        "starting pipeline run"
+    );
     let plan = build_plan(args)?;
-    let tools = ExternalTools::from_args(args);
 
     if args.nproc > 1 {
-        for (index, region) in args.chr.iter().enumerate() {
-            let output_path = plan
-                .output_paths
-                .get(index)
-                .ok_or_else(|| AppError::ParseError {
-                    message: "missing output path for region".to_string(),
-                })?;
-            run_one(args, &tools, std::slice::from_ref(region), output_path)?;
-        }
+        let work = args
+            .chr
+            .iter()
+            .enumerate()
+            .map(|(index, region)| {
+                let output_path = plan
+                    .output_paths
+                    .get(index)
+                    .ok_or_else(|| AppError::ParseError {
+                        message: "missing output path for region".to_string(),
+                    })?
+                    .clone();
+                Ok((region.clone(), output_path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(args.nproc)
+            .build()
+            .map_err(|err| AppError::ParseError {
+                message: format!("failed to initialize rayon thread pool: {err}"),
+            })?;
+
+        pool.install(|| {
+            work.par_iter().try_for_each(|(region, output_path)| {
+                let tools = ExternalTools::from_args(args);
+                run_one(args, &tools, std::slice::from_ref(region), output_path)
+            })
+        })?;
     } else {
+        let tools = ExternalTools::from_args(args);
         run_one(args, &tools, &args.chr, &args.out)?;
     }
 
@@ -68,13 +97,12 @@ fn run_one(
     regions: &[String],
     output: &str,
 ) -> Result<()> {
-    let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, regions)?;
-    let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
-        Some(open_pileup_stream(args, tools, normal2_path, regions)?)
-    } else {
-        None
-    };
-
+    info!(
+        output = %output,
+        regions = %if regions.is_empty() { "all".to_string() } else { regions.join(",") },
+        pileup_mode = args.pileup,
+        "starting region pipeline"
+    );
     let mut gc_filter: HashSet<String> = HashSet::new();
     if !regions.is_empty() {
         gc_filter.extend(
@@ -97,8 +125,61 @@ fn run_one(
             Some(&gc_filter)
         },
     )?;
+    let gc_interval_count = gc_intervals.values().map(Vec::len).sum::<usize>();
+    info!(
+        chromosomes = gc_intervals.len(),
+        intervals = gc_interval_count,
+        "loaded gc intervals"
+    );
 
-    let mut normal_stream = open_pileup_stream(args, tools, &args.normal, regions)?;
+    let effective_regions = if regions.is_empty() {
+        Vec::new()
+    } else {
+        filter_regions_with_gc(regions, &gc_intervals)
+    };
+
+    if !regions.is_empty() {
+        let skipped_regions = regions.len().saturating_sub(effective_regions.len());
+        if skipped_regions > 0 {
+            info!(
+                requested = regions.len(),
+                retained = effective_regions.len(),
+                skipped = skipped_regions,
+                "filtered regions with no GC overlap before mpileup"
+            );
+        }
+        if effective_regions.is_empty() {
+            info!(
+                output = %output,
+                "no requested regions overlap GC intervals; writing header-only output"
+            );
+            writer::with_text_output_writer(output, tools, |out| {
+                writer::write_seqz_header(out)?;
+                Ok(())
+            })?;
+            if output.ends_with(".gz") {
+                info!(output = %output, "indexing compressed seqz with tabix");
+                tools.tabix_index_seqz(output)?;
+            }
+            info!(output = %output, "completed region pipeline");
+            return Ok(());
+        }
+    }
+
+    let region_scope: &[String] = if regions.is_empty() {
+        regions
+    } else {
+        effective_regions.as_slice()
+    };
+
+    let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, region_scope)?;
+    let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
+        Some(open_pileup_stream(args, tools, normal2_path, region_scope)?)
+    } else {
+        None
+    };
+
+    let mut normal_stream = open_pileup_stream(args, tools, &args.normal, region_scope)?;
     let mut tumor_current = tumor_stream.next_record()?;
     let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
         stream.next_record()?
@@ -115,11 +196,10 @@ fn run_one(
         het_only: false,
     };
 
-    let mut progress = PipelineProgress::new(args.progress, output, regions);
+    let mut progress = PipelineProgress::new(args.progress, output, region_scope);
 
     writer::with_text_output_writer(output, tools, move |out| {
-        out.write_all(seqz_header().join("\t").as_bytes())?;
-        out.write_all(b"\n")?;
+        writer::write_seqz_header(out)?;
 
         let mut normal_line = String::with_capacity(96);
         let mut tumor_line = String::with_capacity(96);
@@ -181,8 +261,10 @@ fn run_one(
     })?;
 
     if output.ends_with(".gz") {
+        info!(output = %output, "indexing compressed seqz with tabix");
         tools.tabix_index_seqz(output)?;
     }
+    info!(output = %output, "completed region pipeline");
     Ok(())
 }
 
@@ -274,6 +356,7 @@ fn open_pileup_stream(
     regions: &[String],
 ) -> Result<PileupStream> {
     if args.pileup {
+        info!(input = %input_path, regions = regions.len(), "opening pileup input stream");
         if regions.is_empty() {
             PileupStream::from_path(input_path)
         } else {
@@ -287,17 +370,8 @@ fn open_pileup_stream(
             .ok_or_else(|| AppError::MissingRequired {
                 field: "--fasta (required when input is BAM)".to_string(),
             })?;
-        if regions.len() <= 1 {
-            let stream = tools.spawn_samtools_mpileup_stream(
-                input_path,
-                fasta,
-                regions.first().map(String::as_str),
-            )?;
-            PileupStream::from_command_stream(stream)
-        } else {
-            let tempfile = tools.run_samtools_mpileup_to_tempfile(input_path, fasta, regions)?;
-            PileupStream::from_tempfile(tempfile)
-        }
+        info!(input = %input_path, regions = regions.len(), "opening BAM mpileup stream");
+        PileupStream::from_bam_mpileup_stream(tools, input_path, fasta, regions)
     }
 }
 
@@ -306,6 +380,7 @@ struct PileupStream {
     line_buffer: String,
     _tempfile: Option<NamedTempFile>,
     process: Option<StreamProcess>,
+    region_source: Option<RegionStreamSource>,
 }
 
 #[derive(Debug)]
@@ -314,6 +389,35 @@ struct StreamProcess {
     stderr_capture: NamedTempFile,
     command: String,
     finished: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RegionStreamSource {
+    tools: ExternalTools,
+    bam: String,
+    fasta: String,
+    pending_regions: VecDeque<String>,
+}
+
+impl RegionStreamSource {
+    fn new(tools: ExternalTools, bam: String, fasta: String, regions: &[String]) -> Self {
+        Self {
+            tools,
+            bam,
+            fasta,
+            pending_regions: regions.iter().cloned().collect(),
+        }
+    }
+
+    fn spawn_next(&mut self) -> Result<Option<CommandStream>> {
+        let Some(region) = self.pending_regions.pop_front() else {
+            return Ok(None);
+        };
+        info!(region = %region, "spawning next region mpileup stream");
+        self.tools
+            .spawn_samtools_mpileup_stream(&self.bam, &self.fasta, Some(region.as_str()))
+            .map(Some)
+    }
 }
 
 impl StreamProcess {
@@ -336,6 +440,7 @@ impl PileupStream {
                 line_buffer: String::new(),
                 _tempfile: None,
                 process: None,
+                region_source: None,
             })
         } else {
             let file = File::open(path)?;
@@ -344,6 +449,7 @@ impl PileupStream {
                 line_buffer: String::new(),
                 _tempfile: None,
                 process: None,
+                region_source: None,
             })
         }
     }
@@ -355,7 +461,29 @@ impl PileupStream {
             line_buffer: String::new(),
             _tempfile: Some(tempfile),
             process: None,
+            region_source: None,
         })
+    }
+
+    fn from_bam_mpileup_stream(
+        tools: &ExternalTools,
+        bam: &str,
+        fasta: &str,
+        regions: &[String],
+    ) -> Result<Self> {
+        if regions.is_empty() {
+            let stream = tools.spawn_samtools_mpileup_stream(bam, fasta, None)?;
+            return Self::from_command_stream(stream);
+        }
+
+        let mut source =
+            RegionStreamSource::new(tools.clone(), bam.to_string(), fasta.to_string(), regions);
+        let first = source.spawn_next()?.ok_or_else(|| AppError::ParseError {
+            message: "failed to initialize region mpileup stream".to_string(),
+        })?;
+        let mut stream = Self::from_command_stream(first)?;
+        stream.region_source = Some(source);
+        Ok(stream)
     }
 
     fn from_command_stream(stream: CommandStream) -> Result<Self> {
@@ -370,7 +498,30 @@ impl PileupStream {
             line_buffer: String::new(),
             _tempfile: None,
             process: Some(process),
+            region_source: None,
         })
+    }
+
+    fn set_command_stream(&mut self, stream: CommandStream) {
+        self.reader = Box::new(BufReader::new(stream.stdout));
+        self.process = Some(StreamProcess {
+            child: stream.child,
+            stderr_capture: stream.stderr_capture,
+            command: stream.command,
+            finished: false,
+        });
+        self.line_buffer.clear();
+    }
+
+    fn advance_region_stream(&mut self) -> Result<bool> {
+        let Some(source) = self.region_source.as_mut() else {
+            return Ok(false);
+        };
+        let Some(next_stream) = source.spawn_next()? else {
+            return Ok(false);
+        };
+        self.set_command_stream(next_stream);
+        Ok(true)
     }
 
     fn ensure_process_completed(&mut self) -> Result<()> {
@@ -383,6 +534,7 @@ impl PileupStream {
 
         let status = process.child.wait()?;
         process.finished = true;
+        info!(command = %process.command, code = ?status.code(), "mpileup stream completed");
         if !status.success() {
             return Err(AppError::CommandFailed {
                 command: process.command.clone(),
@@ -399,6 +551,9 @@ impl PileupStream {
             let read = self.reader.read_line(&mut self.line_buffer)?;
             if read == 0 {
                 self.ensure_process_completed()?;
+                if self.advance_region_stream()? {
+                    continue;
+                }
                 return Ok(None);
             }
             let line = self.line_buffer.trim_end_matches(['\n', '\r']);
@@ -534,7 +689,7 @@ fn advance_to_target(
 struct GcInterval {
     start: i32,
     end: i32,
-    gc: Arc<str>,
+    gc: String,
 }
 
 #[cfg(test)]
@@ -564,7 +719,6 @@ fn parse_gc_intervals_from_reader<R: BufRead>(
     let mut current_span: i32 = 0;
     let mut keep_current = false;
     let mut map: HashMap<String, Vec<GcInterval>> = HashMap::new();
-    let mut gc_values: HashMap<String, Arc<str>> = HashMap::new();
 
     let mut buf = String::new();
     loop {
@@ -611,12 +765,11 @@ fn parse_gc_intervals_from_reader<R: BufRead>(
         let Some(start) = start_str.parse::<i32>().ok() else {
             continue;
         };
-        let interned_gc = intern_gc_value(&mut gc_values, gc);
 
         map.entry(chromosome.clone()).or_default().push(GcInterval {
             start,
             end: start + current_span,
-            gc: interned_gc,
+            gc: gc.to_string(),
         });
     }
     Ok(map)
@@ -631,7 +784,6 @@ fn parse_gc_intervals_filtered(
     let mut current_span: i32 = 0;
     let mut map: HashMap<String, Vec<GcInterval>> = HashMap::new();
     let mut keep_current = false;
-    let mut gc_values: HashMap<String, Arc<str>> = HashMap::new();
 
     for line in lines {
         if line.starts_with("variableStep") {
@@ -670,27 +822,55 @@ fn parse_gc_intervals_filtered(
         let Some(start) = start_str.parse::<i32>().ok() else {
             continue;
         };
-        let interned_gc = intern_gc_value(&mut gc_values, gc);
 
         map.entry(chromosome.clone()).or_default().push(GcInterval {
             start,
             end: start + current_span,
-            gc: interned_gc,
+            gc: gc.to_string(),
         });
     }
 
     map
 }
 
-fn intern_gc_value(cache: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
-    if let Some(existing) = cache.get(value) {
-        return Arc::clone(existing);
+fn filter_regions_with_gc(
+    regions: &[String],
+    gc_map: &HashMap<String, Vec<GcInterval>>,
+) -> Vec<String> {
+    regions
+        .iter()
+        .filter(|region| region_overlaps_gc(gc_map, region))
+        .cloned()
+        .collect()
+}
+
+fn region_overlaps_gc(gc_map: &HashMap<String, Vec<GcInterval>>, region: &str) -> bool {
+    let chromosome = region_chromosome(region);
+    let Some(intervals) = gc_map.get(chromosome) else {
+        return false;
+    };
+    if intervals.is_empty() {
+        return false;
     }
 
-    let key = value.to_string();
-    let arc: Arc<str> = Arc::from(key.as_str());
-    cache.insert(key, Arc::clone(&arc));
-    arc
+    let Some((start, end)) = parse_region_bounds(region) else {
+        return true;
+    };
+
+    let index = intervals.partition_point(|interval| interval.start <= end);
+    intervals[..index]
+        .iter()
+        .rev()
+        .take_while(|interval| interval.end > start)
+        .any(|interval| interval.start <= end)
+}
+
+fn parse_region_bounds(region: &str) -> Option<(i32, i32)> {
+    let (_, bounds) = region.split_once(':')?;
+    let (start_raw, end_raw) = bounds.split_once('-')?;
+    let start = start_raw.replace(',', "").parse::<i32>().ok()?;
+    let end = end_raw.replace(',', "").parse::<i32>().ok()?;
+    (end >= start).then_some((start, end))
 }
 
 fn region_chromosome(region: &str) -> &str {
@@ -708,7 +888,7 @@ fn gc_value_at<'a>(
         return None;
     }
     let interval = &intervals[index - 1];
-    (position < interval.end).then_some(interval.gc.as_ref())
+    (position < interval.end).then_some(interval.gc.as_str())
 }
 
 fn output_for_region(output: &str, region: &str) -> String {
@@ -812,5 +992,30 @@ mod tests {
         let map = super::parse_gc_intervals(lines);
         assert_eq!(super::gc_value_at(&map, "12", 101), Some("40"));
         assert_eq!(super::gc_value_at(&map, "12", 151), Some("42"));
+    }
+
+    #[test]
+    fn filters_regions_without_gc_overlap() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+            "200\t50".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let regions = vec![
+            "chr20:100-140".to_string(),
+            "chr20:151-190".to_string(),
+            "chr21:100-140".to_string(),
+            "chr20:bad-range".to_string(),
+        ];
+
+        let filtered = super::filter_regions_with_gc(&regions, &map);
+        assert_eq!(
+            filtered,
+            vec![
+                "chr20:100-140".to_string(),
+                "chr20:bad-range".to_string(),
+            ]
+        );
     }
 }

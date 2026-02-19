@@ -7,6 +7,20 @@ pub mod writer;
 
 use cli::Bam2SeqzArgs;
 use errors::Result;
+use std::sync::Once;
+use tracing_subscriber::EnvFilter;
+
+static TRACING_INIT: Once = Once::new();
+
+pub fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .try_init();
+    });
+}
 
 pub fn run_from_args(args: Bam2SeqzArgs) -> Result<()> {
     pipeline::run(&args)

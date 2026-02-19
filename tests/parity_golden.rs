@@ -15,16 +15,11 @@ fn golden_dir() -> PathBuf {
 }
 
 fn run_binary(args: &[&str]) -> std::process::Output {
-    let mut command = Command::new("cargo");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bam2seqz_rs"));
+    command.args(args).current_dir(workspace_dir());
     command
-        .arg("run")
-        .arg("--quiet")
-        .arg("--bin")
-        .arg("bam2seqz_rs")
-        .arg("--")
-        .args(args)
-        .current_dir(workspace_dir());
-    command.output().expect("expected cargo run to execute")
+        .output()
+        .expect("expected bam2seqz_rs binary to execute")
 }
 
 const NORMAL_BAM: &str = "testdata/NA12878.chrom20.synthetic.seed20260218.normal.chr.bam";
