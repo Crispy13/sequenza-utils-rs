@@ -9,7 +9,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{Builder, NamedTempFile};
 use tracing::info;
+
+const AUTO_BIN_SIZE_BP: i32 = 5_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelinePlan {
@@ -65,8 +67,18 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
     let gc_intervals = Arc::new(load_gc_intervals_for_run(args, &base_tools)?);
 
     if args.nproc > 1 {
+        if should_auto_bin_parallel(args) {
+            let auto_regions = derive_auto_binned_regions(args, &base_tools, gc_intervals.as_ref())?;
+            info!(
+                bins = auto_regions.len(),
+                bin_size_bp = AUTO_BIN_SIZE_BP,
+                "running auto-binned parallel mode with ordered single output"
+            );
+            return run_parallel_single_output(args, gc_intervals, auto_regions);
+        }
+
         if args.parallel_single_output {
-            return run_parallel_single_output(args, gc_intervals);
+            return run_parallel_single_output(args, gc_intervals, args.chr.clone());
         }
 
         let work = args
@@ -114,9 +126,9 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
 fn run_parallel_single_output(
     args: &Bam2SeqzArgs,
     gc_intervals: Arc<HashMap<String, Vec<GcInterval>>>,
+    regions: Vec<String>,
 ) -> Result<()> {
-    let work = args
-        .chr
+    let work = regions
         .iter()
         .enumerate()
         .map(|(index, region)| (index, region.clone()))
@@ -204,6 +216,83 @@ fn run_parallel_single_output(
     }
     info!(output = %args.out, "completed parallel single-output merge");
     Ok(())
+}
+
+fn should_auto_bin_parallel(args: &Bam2SeqzArgs) -> bool {
+    args.nproc > 1 && !args.pileup && !args.has_explicit_ranged_regions()
+}
+
+fn derive_auto_binned_regions(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+) -> Result<Vec<String>> {
+    let chromosomes = if args.chr.is_empty() {
+        tools.list_bam_chromosomes(&args.tumor)?
+    } else {
+        dedup_chromosomes_preserving_order(&args.chr)
+    };
+
+    let bins = auto_bin_regions_for_chromosomes(&chromosomes, gc_intervals, AUTO_BIN_SIZE_BP);
+    Ok(filter_regions_with_gc(&bins, gc_intervals))
+}
+
+fn dedup_chromosomes_preserving_order(chromosomes: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::with_capacity(chromosomes.len());
+    for chromosome in chromosomes {
+        if seen.insert(chromosome.clone()) {
+            ordered.push(chromosome.clone());
+        }
+    }
+    ordered
+}
+
+fn auto_bin_regions_for_chromosomes(
+    chromosomes: &[String],
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+    bin_size_bp: i32,
+) -> Vec<String> {
+    let mut regions = Vec::new();
+    for chromosome in chromosomes {
+        let Some(intervals) = gc_intervals.get(chromosome) else {
+            continue;
+        };
+        let bins = gc_overlapping_bins(intervals, bin_size_bp);
+        for (start, end) in bins {
+            regions.push(format!("{chromosome}:{start}-{end}"));
+        }
+    }
+    regions
+}
+
+fn gc_overlapping_bins(intervals: &[GcInterval], bin_size_bp: i32) -> Vec<(i32, i32)> {
+    if bin_size_bp <= 0 {
+        return Vec::new();
+    }
+
+    let mut bin_ids = BTreeSet::new();
+    for interval in intervals {
+        if interval.end <= interval.start {
+            continue;
+        }
+        let start = interval.start.max(1);
+        let end = (interval.end - 1).max(start);
+        let start_bin = (start - 1) / bin_size_bp;
+        let end_bin = (end - 1) / bin_size_bp;
+        for bin_id in start_bin..=end_bin {
+            let _ = bin_ids.insert(bin_id);
+        }
+    }
+
+    bin_ids
+        .into_iter()
+        .map(|bin_id| {
+            let start = bin_id * bin_size_bp + 1;
+            let end = (bin_id + 1) * bin_size_bp;
+            (start, end)
+        })
+        .collect()
 }
 
 fn run_one(
@@ -1172,6 +1261,48 @@ mod tests {
                 "chr20:100-140".to_string(),
                 "chr20:bad-range".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn auto_bins_gc_intervals_for_requested_chromosomes() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+            "4_999_960\t49".replace('_', ""),
+            "5_000_100\t50".to_string(),
+            "variableStep chrom=chr21 span=50".to_string(),
+            "100\t51".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let chromosomes = vec!["chr20".to_string(), "chr21".to_string()];
+
+        let bins = super::auto_bin_regions_for_chromosomes(&chromosomes, &map, 5_000_000);
+        assert_eq!(
+            bins,
+            vec![
+                "chr20:1-5000000".to_string(),
+                "chr20:5000001-10000000".to_string(),
+                "chr21:1-5000000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_bin_respects_input_chromosome_order() {
+        let lines = vec![
+            "variableStep chrom=chr1 span=50".to_string(),
+            "100\t40".to_string(),
+            "variableStep chrom=chr2 span=50".to_string(),
+            "100\t41".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let chromosomes = vec!["chr2".to_string(), "chr1".to_string()];
+
+        let bins = super::auto_bin_regions_for_chromosomes(&chromosomes, &map, 5_000_000);
+        assert_eq!(
+            bins,
+            vec!["chr2:1-5000000".to_string(), "chr1:1-5000000".to_string()]
         );
     }
 }

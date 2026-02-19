@@ -307,6 +307,42 @@ fn rust_parallel_single_output_preserves_region_order() {
 }
 
 #[test]
+fn rust_parallel_auto_binning_matches_golden_bam_default_single_output() {
+    let out = workspace_dir()
+        .join("target")
+        .join("it_parallel_auto_binning.seqz.gz");
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(tabix_index_path(&out));
+
+    let run = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "--parallel",
+        "2",
+        "-o",
+        "target/it_parallel_auto_binning.seqz.gz",
+    ]);
+    assert!(
+        run.status.success(),
+        "parallel auto-binning run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_output_and_index_exist(&out);
+
+    let actual = gunzip_to_text(&out);
+    let expected =
+        fs::read_to_string(golden_dir().join("bam_default.seqz")).expect("expected golden text");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn rust_matches_golden_normal2() {
     let normal2_out = workspace_dir().join("target").join("it_normal2.seqz.gz");
     let _ = fs::remove_file(&normal2_out);

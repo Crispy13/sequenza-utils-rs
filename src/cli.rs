@@ -127,6 +127,10 @@ impl Bam2SeqzArgs {
         self.qlimit + self.qformat.offset()
     }
 
+    pub fn has_explicit_ranged_regions(&self) -> bool {
+        self.chr.iter().any(|region| region.contains(':'))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.normal.is_empty() {
             return Err(AppError::MissingRequired {
@@ -149,11 +153,14 @@ impl Bam2SeqzArgs {
             });
         }
         if self.nproc > 1 && self.chr.len() < 2 {
-            return Err(AppError::InvalidValue {
-                flag: "--parallel".to_string(),
-                value: self.nproc.to_string(),
-                reason: "--chromosome must include at least two regions".to_string(),
-            });
+            let can_auto_bin_without_ranges = !self.pileup && !self.has_explicit_ranged_regions();
+            if !can_auto_bin_without_ranges {
+                return Err(AppError::InvalidValue {
+                    flag: "--parallel".to_string(),
+                    value: self.nproc.to_string(),
+                    reason: "--chromosome must include at least two regions".to_string(),
+                });
+            }
         }
         if self.nproc > 1 && self.out == "-" {
             return Err(AppError::InvalidValue {
@@ -443,5 +450,51 @@ mod tests {
         .expect("expected parse success");
 
         assert!(args.parallel_single_output);
+    }
+
+    #[test]
+    fn accepts_parallel_without_chromosome_for_bam_input() {
+        let args = parse_args([
+            "bam2seqz_rs",
+            "-n",
+            "normal.bam",
+            "-t",
+            "tumor.bam",
+            "-gc",
+            "gc.wig.gz",
+            "-F",
+            "ref.fa",
+            "--parallel",
+            "4",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        assert_eq!(args.nproc, 4);
+        assert!(args.chr.is_empty());
+    }
+
+    #[test]
+    fn rejects_single_ranged_region_with_parallel() {
+        let result = parse_args([
+            "bam2seqz_rs",
+            "-n",
+            "normal.bam",
+            "-t",
+            "tumor.bam",
+            "-gc",
+            "gc.wig.gz",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr20:1-100",
+            "--parallel",
+            "2",
+            "-o",
+            "out.seqz.gz",
+        ]);
+
+        assert!(result.is_err());
     }
 }
