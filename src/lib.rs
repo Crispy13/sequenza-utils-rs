@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod errors;
 pub mod external_tools;
+#[cfg(feature = "htslib-prototype")]
+pub mod htslib_mpileup;
 pub mod pipeline;
 pub mod seqz_core;
 pub mod writer;

@@ -1,6 +1,6 @@
 use crate::errors::{AppError, Result};
 use clap::error::ErrorKind;
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Debug, Clone, Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
@@ -29,6 +29,8 @@ struct CliArgs {
     samtools: String,
     #[arg(short = 'T', long = "tabix", default_value = "tabix")]
     tabix: String,
+    #[arg(long = "bam-backend", value_enum, default_value_t = BamBackend::Samtools)]
+    bam_backend: BamBackend,
     #[arg(short = 'q', long = "qlimit", default_value = "20")]
     qlimit: String,
     #[arg(short = 'f', long = "qformat", default_value = "sanger")]
@@ -43,6 +45,12 @@ struct CliArgs {
     het_f: String,
     #[arg(long = "progress", action = ArgAction::SetTrue)]
     progress: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BamBackend {
+    Samtools,
+    RustHtslib,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +95,7 @@ pub struct Bam2SeqzArgs {
     pub parallel_single_output: bool,
     pub samtools: String,
     pub tabix: String,
+    pub bam_backend: BamBackend,
     pub qlimit: i32,
     pub qformat: QualityFormat,
     pub depth_sum: i32,
@@ -111,6 +120,7 @@ impl Default for Bam2SeqzArgs {
             parallel_single_output: false,
             samtools: "samtools".to_string(),
             tabix: "tabix".to_string(),
+            bam_backend: BamBackend::Samtools,
             qlimit: 20,
             qformat: QualityFormat::Sanger,
             depth_sum: 20,
@@ -150,6 +160,13 @@ impl Bam2SeqzArgs {
         if !self.pileup && self.fasta.is_none() {
             return Err(AppError::MissingRequired {
                 field: "--fasta (required when input is BAM)".to_string(),
+            });
+        }
+        if self.pileup && self.bam_backend != BamBackend::Samtools {
+            return Err(AppError::InvalidValue {
+                flag: "--bam-backend".to_string(),
+                value: "rust-htslib".to_string(),
+                reason: "only BAM input mode supports backend selection".to_string(),
             });
         }
         if self.nproc > 1 && self.chr.len() < 2 {
@@ -206,6 +223,7 @@ where
         parallel_single_output: cli.parallel_single_output,
         samtools: cli.samtools,
         tabix: cli.tabix,
+        bam_backend: cli.bam_backend,
         qlimit: parse_i32("-q", &cli.qlimit)?,
         qformat: QualityFormat::parse(&cli.qformat)?,
         depth_sum: parse_i32("-N", &cli.depth_sum)?,
@@ -295,7 +313,7 @@ fn parse_f64(flag: &str, value: &str) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{QualityFormat, parse_args};
+    use super::{BamBackend, QualityFormat, parse_args};
 
     #[test]
     fn parses_minimal_bam_arguments() {
@@ -493,6 +511,44 @@ mod tests {
             "2",
             "-o",
             "out.seqz.gz",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_experimental_rust_htslib_backend() {
+        let args = parse_args([
+            "bam2seqz_rs",
+            "-n",
+            "normal.bam",
+            "-t",
+            "tumor.bam",
+            "-gc",
+            "gc.wig.gz",
+            "-F",
+            "ref.fa",
+            "--bam-backend",
+            "rust-htslib",
+        ])
+        .expect("expected parse success");
+
+        assert_eq!(args.bam_backend, BamBackend::RustHtslib);
+    }
+
+    #[test]
+    fn rejects_backend_selection_for_pileup_mode() {
+        let result = parse_args([
+            "bam2seqz_rs",
+            "--pileup",
+            "-n",
+            "normal.pileup.gz",
+            "-t",
+            "tumor.pileup.gz",
+            "-gc",
+            "gc.wig.gz",
+            "--bam-backend",
+            "rust-htslib",
         ]);
 
         assert!(result.is_err());

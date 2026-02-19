@@ -1,4 +1,4 @@
-use crate::cli::Bam2SeqzArgs;
+use crate::cli::{Bam2SeqzArgs, BamBackend};
 use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
 use crate::seqz_core::{SeqzParams, do_seqz};
@@ -8,6 +8,8 @@ use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
+#[cfg(feature = "htslib-prototype")]
+use rust_htslib::bam::Read as _;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -136,22 +138,58 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
                 message: format!("failed to initialize rayon thread pool: {err}"),
             })?;
 
-        pool.install(|| {
-            work.par_iter().try_for_each(|(region, output_path, overlaps_gc)| {
-                let tools = ExternalTools::from_args(args);
-                if *overlaps_gc {
-                    run_one(
-                        args,
-                        &tools,
-                        std::slice::from_ref(region),
-                        output_path,
-                        gc_intervals.as_ref(),
+        if !args.pileup && args.bam_backend == BamBackend::RustHtslib {
+            #[cfg(feature = "htslib-prototype")]
+            {
+                pool.install(|| {
+                    work.par_iter().try_for_each_init(
+                        || crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
+                        |context, (region, output_path, overlaps_gc)| {
+                            let tools = ExternalTools::from_args(args);
+                            if *overlaps_gc {
+                                run_one_with_htslib_context(
+                                    args,
+                                    &tools,
+                                    context,
+                                    std::slice::from_ref(region),
+                                    output_path,
+                                    gc_intervals.as_ref(),
+                                )
+                            } else {
+                                write_header_only_output(output_path, &tools)
+                            }
+                        },
                     )
-                } else {
-                    write_header_only_output(output_path, &tools)
-                }
-            })
-        })?;
+                })?;
+            }
+            #[cfg(not(feature = "htslib-prototype"))]
+            {
+                return Err(AppError::InvalidValue {
+                    flag: "--bam-backend".to_string(),
+                    value: "rust-htslib".to_string(),
+                    reason:
+                        "binary built without feature \"htslib-prototype\"; rebuild with --features htslib-prototype"
+                            .to_string(),
+                });
+            }
+        } else {
+            pool.install(|| {
+                work.par_iter().try_for_each(|(region, output_path, overlaps_gc)| {
+                    let tools = ExternalTools::from_args(args);
+                    if *overlaps_gc {
+                        run_one(
+                            args,
+                            &tools,
+                            std::slice::from_ref(region),
+                            output_path,
+                            gc_intervals.as_ref(),
+                        )
+                    } else {
+                        write_header_only_output(output_path, &tools)
+                    }
+                })
+            })?;
+        }
     } else {
         run_one(args, &base_tools, &args.chr, &args.out, gc_intervals.as_ref())?;
     }
@@ -181,41 +219,91 @@ fn run_parallel_single_output(
         .map_err(|err| AppError::ParseError {
             message: format!("failed to initialize rayon thread pool: {err}"),
         })?;
-
-    let (sender, receiver) = unbounded::<Result<RegionChunk>>();
-    pool.install(|| {
-        work.par_iter().for_each_with(sender, |tx, (index, region)| {
-            let result = (|| {
-                let tools = ExternalTools::from_args(args);
-                let chunk_file = Builder::new()
-                    .prefix("bam2seqz_rs_parallel_chunk_")
-                    .suffix(".seqz")
-                    .tempfile_in("tmp")?;
-                let chunk_path = chunk_file.path().to_string_lossy().into_owned();
-                run_one(
-                    args,
-                    &tools,
-                    std::slice::from_ref(region),
-                    &chunk_path,
-                    gc_intervals.as_ref(),
-                )?;
-                Ok(RegionChunk {
-                    index: *index,
-                    region: region.clone(),
-                    chunk_file,
-                })
-            })();
-            let _ = tx.send(result);
-        });
-    });
-
     let mut chunks: Vec<Option<RegionChunk>> = (0..work.len()).map(|_| None).collect();
-    for _ in 0..work.len() {
-        let region_chunk = receiver.recv().map_err(|err| AppError::ParseError {
-            message: format!("failed to receive parallel region result: {err}"),
-        })??;
-        let index = region_chunk.index;
-        chunks[index] = Some(region_chunk);
+
+    if !args.pileup && args.bam_backend == BamBackend::RustHtslib {
+        #[cfg(feature = "htslib-prototype")]
+        {
+            let chunk_results = pool.install(|| {
+                work.par_iter()
+                    .map_init(
+                        || crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
+                        |context, (index, region)| -> Result<RegionChunk> {
+                            let tools = ExternalTools::from_args(args);
+                            let chunk_file = Builder::new()
+                                .prefix("bam2seqz_rs_parallel_chunk_")
+                                .suffix(".seqz")
+                                .tempfile_in("tmp")?;
+                            let chunk_path = chunk_file.path().to_string_lossy().into_owned();
+                            run_one_with_htslib_context(
+                                args,
+                                &tools,
+                                context,
+                                std::slice::from_ref(region),
+                                &chunk_path,
+                                gc_intervals.as_ref(),
+                            )?;
+                            Ok(RegionChunk {
+                                index: *index,
+                                region: region.clone(),
+                                chunk_file,
+                            })
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            });
+
+            for chunk_result in chunk_results {
+                let region_chunk = chunk_result?;
+                let index = region_chunk.index;
+                chunks[index] = Some(region_chunk);
+            }
+        }
+        #[cfg(not(feature = "htslib-prototype"))]
+        {
+            return Err(AppError::InvalidValue {
+                flag: "--bam-backend".to_string(),
+                value: "rust-htslib".to_string(),
+                reason:
+                    "binary built without feature \"htslib-prototype\"; rebuild with --features htslib-prototype"
+                        .to_string(),
+            });
+        }
+    } else {
+        let (sender, receiver) = unbounded::<Result<RegionChunk>>();
+        pool.install(|| {
+            work.par_iter().for_each_with(sender, |tx, (index, region)| {
+                let result = (|| {
+                    let tools = ExternalTools::from_args(args);
+                    let chunk_file = Builder::new()
+                        .prefix("bam2seqz_rs_parallel_chunk_")
+                        .suffix(".seqz")
+                        .tempfile_in("tmp")?;
+                    let chunk_path = chunk_file.path().to_string_lossy().into_owned();
+                    run_one(
+                        args,
+                        &tools,
+                        std::slice::from_ref(region),
+                        &chunk_path,
+                        gc_intervals.as_ref(),
+                    )?;
+                    Ok(RegionChunk {
+                        index: *index,
+                        region: region.clone(),
+                        chunk_file,
+                    })
+                })();
+                let _ = tx.send(result);
+            });
+        });
+
+        for _ in 0..work.len() {
+            let region_chunk = receiver.recv().map_err(|err| AppError::ParseError {
+                message: format!("failed to receive parallel region result: {err}"),
+            })??;
+            let index = region_chunk.index;
+            chunks[index] = Some(region_chunk);
+        }
     }
 
     let tools = ExternalTools::from_args(args);
@@ -376,6 +464,31 @@ fn run_one(
         effective_regions.as_slice()
     };
 
+    if !args.pileup && args.bam_backend == BamBackend::RustHtslib {
+        #[cfg(feature = "htslib-prototype")]
+        {
+            let mut context = crate::htslib_mpileup::HtslibWorkerContext::from_args(args);
+            return run_one_with_htslib_context(
+                args,
+                tools,
+                &mut context,
+                region_scope,
+                output,
+                gc_intervals,
+            );
+        }
+        #[cfg(not(feature = "htslib-prototype"))]
+        {
+            return Err(AppError::InvalidValue {
+                flag: "--bam-backend".to_string(),
+                value: "rust-htslib".to_string(),
+                reason:
+                    "binary built without feature \"htslib-prototype\"; rebuild with --features htslib-prototype"
+                        .to_string(),
+            });
+        }
+    }
+
     let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, region_scope)?;
     let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
         Some(open_pileup_stream(args, tools, normal2_path, region_scope)?)
@@ -470,6 +583,183 @@ fn run_one(
     }
     info!(output = %output, "completed region pipeline");
     Ok(())
+}
+
+#[cfg(feature = "htslib-prototype")]
+fn run_one_with_htslib_context(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    context: &mut crate::htslib_mpileup::HtslibWorkerContext,
+    regions: &[String],
+    output: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+) -> Result<()> {
+    let params = SeqzParams {
+        depth_sum: args.depth_sum,
+        qlimit: args.qlimit_ascii().clamp(0, i32::from(u8::MAX)) as u8,
+        hom_t: args.hom,
+        het_t: args.het,
+        het_f: args.het_f,
+        het_only: false,
+    };
+
+    let mut progress = PipelineProgress::new(args.progress, output, regions);
+
+    let mut resolved_regions = context.resolve_regions(regions)?;
+    if regions.is_empty() {
+        let filtered = filter_regions_with_gc(&resolved_regions, gc_intervals);
+        let skipped_regions = resolved_regions.len().saturating_sub(filtered.len());
+        if skipped_regions > 0 {
+            info!(
+                requested = resolved_regions.len(),
+                retained = filtered.len(),
+                skipped = skipped_regions,
+                "filtered regions with no GC overlap before htslib processing"
+            );
+        }
+        resolved_regions = filtered;
+    }
+
+    writer::with_text_output_writer(output, tools, |out| {
+        writer::write_seqz_header(out)?;
+
+        let mut normal_line = String::with_capacity(96);
+        let mut tumor_line = String::with_capacity(96);
+        let mut alt_line = String::with_capacity(96);
+
+        for region in resolved_regions {
+            let mut readers = context.readers_mut()?;
+            let region_spec = crate::htslib_mpileup::parse_region_spec(readers.tumor, &region)?;
+            let reference_bases =
+                crate::htslib_mpileup::fetch_reference_bases(readers.fasta, &region_spec)?;
+
+            crate::htslib_mpileup::fetch_region(readers.normal, &region_spec)?;
+            crate::htslib_mpileup::fetch_region(readers.tumor, &region_spec)?;
+            if let Some(reader) = readers.normal2.as_deref_mut() {
+                crate::htslib_mpileup::fetch_region(reader, &region_spec)?;
+            }
+
+            let mut normal_iter = readers.normal.pileup();
+            let mut tumor_iter = readers.tumor.pileup();
+            let mut alt_iter = readers.normal2.as_deref_mut().map(|reader| reader.pileup());
+
+            let mut tumor_current = crate::htslib_mpileup::next_record_from_pileups(
+                &mut tumor_iter,
+                &region_spec,
+                &reference_bases,
+            )?;
+            let mut alt_current = if let Some(iter) = alt_iter.as_mut() {
+                crate::htslib_mpileup::next_record_from_pileups(
+                    iter,
+                    &region_spec,
+                    &reference_bases,
+                )?
+            } else {
+                None
+            };
+
+            while let Some(normal) = crate::htslib_mpileup::next_record_from_pileups(
+                &mut normal_iter,
+                &region_spec,
+                &reference_bases,
+            )? {
+                progress.on_processed(&normal.chromosome, normal.position);
+
+                while let Some(tumor) = tumor_current.as_ref() {
+                    if compare_htslib_coordinates(tumor, &normal) == Ordering::Less {
+                        tumor_current = crate::htslib_mpileup::next_record_from_pileups(
+                            &mut tumor_iter,
+                            &region_spec,
+                            &reference_bases,
+                        )?;
+                        continue;
+                    }
+                    break;
+                }
+
+                let Some(tumor) = tumor_current.as_ref() else {
+                    break;
+                };
+                if compare_htslib_coordinates(tumor, &normal) != Ordering::Equal {
+                    continue;
+                }
+
+                let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position)
+                else {
+                    continue;
+                };
+
+                normal.write_data_line(&mut normal_line);
+                tumor.write_data_line(&mut tumor_line);
+
+                let seqz_fields = if let Some(iter) = alt_iter.as_mut() {
+                    while let Some(alt) = alt_current.as_ref() {
+                        if compare_htslib_coordinates(alt, &normal) == Ordering::Less {
+                            alt_current = crate::htslib_mpileup::next_record_from_pileups(
+                                iter,
+                                &region_spec,
+                                &reference_bases,
+                            )?;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if let Some(alt) = alt_current.as_ref() {
+                        if compare_htslib_coordinates(alt, &normal) == Ordering::Equal {
+                            alt.write_data_line(&mut alt_line);
+                            do_seqz(
+                                &[
+                                    normal_line.as_str(),
+                                    tumor_line.as_str(),
+                                    gc,
+                                    alt_line.as_str(),
+                                ],
+                                &params,
+                            )
+                        } else {
+                            do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                        }
+                    } else {
+                        do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                    }
+                } else {
+                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                };
+
+                if let Some(seqz) = seqz_fields {
+                    progress.on_emitted();
+                    let _ = write!(out, "{}\t{}", normal.chromosome, normal.position);
+                    for field in seqz {
+                        out.write_all(b"\t")?;
+                        out.write_all(field.as_bytes())?;
+                    }
+                    out.write_all(b"\n")?;
+                }
+            }
+        }
+
+        progress.finish();
+        Ok(())
+    })?;
+
+    if output.ends_with(".gz") {
+        info!(output = %output, "indexing compressed seqz with tabix");
+        tools.tabix_index_seqz(output)?;
+    }
+    info!(output = %output, "completed region pipeline");
+    Ok(())
+}
+
+#[cfg(feature = "htslib-prototype")]
+fn compare_htslib_coordinates(
+    left: &crate::htslib_mpileup::HtslibPileupRecord,
+    right: &crate::htslib_mpileup::HtslibPileupRecord,
+) -> Ordering {
+    match compare_chromosomes(&left.chromosome, &right.chromosome) {
+        Ordering::Equal => left.position.cmp(&right.position),
+        other => other,
+    }
 }
 
 fn write_header_only_output(output: &str, tools: &ExternalTools) -> Result<()> {
@@ -591,8 +881,22 @@ fn open_pileup_stream(
             .ok_or_else(|| AppError::MissingRequired {
                 field: "--fasta (required when input is BAM)".to_string(),
             })?;
-        info!(input = %input_path, regions = regions.len(), "opening BAM mpileup stream");
-        PileupStream::from_bam_mpileup_stream(tools, input_path, fasta, regions)
+        match args.bam_backend {
+            BamBackend::Samtools => {
+                info!(
+                    input = %input_path,
+                    regions = regions.len(),
+                    backend = "samtools",
+                    "opening BAM mpileup stream"
+                );
+                PileupStream::from_bam_mpileup_stream(tools, input_path, fasta, regions)
+            }
+            BamBackend::RustHtslib => Err(AppError::ParseError {
+                message:
+                    "internal error: rust-htslib backend must use direct worker-context execution"
+                        .to_string(),
+            }),
+        }
     }
 }
 
