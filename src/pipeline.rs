@@ -78,7 +78,28 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
         }
 
         if args.parallel_single_output {
-            return run_parallel_single_output(args, gc_intervals, args.chr.clone());
+            let effective_regions = if args.chr.is_empty() {
+                Vec::new()
+            } else {
+                let filtered = filter_regions_with_gc(&args.chr, gc_intervals.as_ref());
+                let skipped_regions = args.chr.len().saturating_sub(filtered.len());
+                if skipped_regions > 0 {
+                    info!(
+                        requested = args.chr.len(),
+                        retained = filtered.len(),
+                        skipped = skipped_regions,
+                        "filtered regions with no GC overlap before mpileup"
+                    );
+                }
+                filtered
+            };
+
+            if !args.chr.is_empty() && effective_regions.is_empty() {
+                let tools = ExternalTools::from_args(args);
+                return write_header_only_output(&args.out, &tools);
+            }
+
+            return run_parallel_single_output(args, gc_intervals, effective_regions);
         }
 
         let work = args
@@ -93,9 +114,20 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
                         message: "missing output path for region".to_string(),
                     })?
                     .clone();
-                Ok((region.clone(), output_path))
+                let overlaps_gc = region_overlaps_gc(gc_intervals.as_ref(), region);
+                Ok((region.clone(), output_path, overlaps_gc))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        let skipped_regions = work.iter().filter(|(_, _, overlaps_gc)| !*overlaps_gc).count();
+        if skipped_regions > 0 {
+            info!(
+                requested = work.len(),
+                retained = work.len().saturating_sub(skipped_regions),
+                skipped = skipped_regions,
+                "filtered regions with no GC overlap before mpileup"
+            );
+        }
 
         let pool = ThreadPoolBuilder::new()
             .num_threads(args.nproc)
@@ -105,15 +137,19 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
             })?;
 
         pool.install(|| {
-            work.par_iter().try_for_each(|(region, output_path)| {
+            work.par_iter().try_for_each(|(region, output_path, overlaps_gc)| {
                 let tools = ExternalTools::from_args(args);
-                run_one(
-                    args,
-                    &tools,
-                    std::slice::from_ref(region),
-                    output_path,
-                    gc_intervals.as_ref(),
-                )
+                if *overlaps_gc {
+                    run_one(
+                        args,
+                        &tools,
+                        std::slice::from_ref(region),
+                        output_path,
+                        gc_intervals.as_ref(),
+                    )
+                } else {
+                    write_header_only_output(output_path, &tools)
+                }
             })
         })?;
     } else {
@@ -128,6 +164,11 @@ fn run_parallel_single_output(
     gc_intervals: Arc<HashMap<String, Vec<GcInterval>>>,
     regions: Vec<String>,
 ) -> Result<()> {
+    if regions.is_empty() {
+        let tools = ExternalTools::from_args(args);
+        return write_header_only_output(&args.out, &tools);
+    }
+
     let work = regions
         .iter()
         .enumerate()
@@ -325,20 +366,7 @@ fn run_one(
             );
         }
         if effective_regions.is_empty() {
-            info!(
-                output = %output,
-                "no requested regions overlap GC intervals; writing header-only output"
-            );
-            writer::with_text_output_writer(output, tools, |out| {
-                writer::write_seqz_header(out)?;
-                Ok(())
-            })?;
-            if output.ends_with(".gz") {
-                info!(output = %output, "indexing compressed seqz with tabix");
-                tools.tabix_index_seqz(output)?;
-            }
-            info!(output = %output, "completed region pipeline");
-            return Ok(());
+            return write_header_only_output(output, tools);
         }
     }
 
@@ -436,6 +464,23 @@ fn run_one(
         Ok(())
     })?;
 
+    if output.ends_with(".gz") {
+        info!(output = %output, "indexing compressed seqz with tabix");
+        tools.tabix_index_seqz(output)?;
+    }
+    info!(output = %output, "completed region pipeline");
+    Ok(())
+}
+
+fn write_header_only_output(output: &str, tools: &ExternalTools) -> Result<()> {
+    info!(
+        output = %output,
+        "no requested regions overlap GC intervals; writing header-only output"
+    );
+    writer::with_text_output_writer(output, tools, |out| {
+        writer::write_seqz_header(out)?;
+        Ok(())
+    })?;
     if output.ends_with(".gz") {
         info!(output = %output, "indexing compressed seqz with tabix");
         tools.tabix_index_seqz(output)?;
