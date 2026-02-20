@@ -1,10 +1,14 @@
 use sequenza_utils::errors::{AppError, Result};
 use clap::{ArgAction, Parser};
+use mimalloc::MiMalloc;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(

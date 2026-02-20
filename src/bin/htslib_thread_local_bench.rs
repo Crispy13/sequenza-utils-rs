@@ -1,11 +1,15 @@
 use bio::io::fasta;
 use clap::Parser;
+use mimalloc::MiMalloc;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
 use std::sync::Mutex;
 use std::time::Instant;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "htslib_thread_local_bench")]
