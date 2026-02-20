@@ -3,7 +3,7 @@ use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
 use crate::seqz_core::{SeqzParams, do_seqz};
 use crate::writer;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::ThreadPoolBuilder;
@@ -14,14 +14,20 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::Child;
 use std::sync::Arc;
-use std::time::Duration;
-use tempfile::{Builder, NamedTempFile};
-use tracing::info;
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+use tracing::{debug, info, warn};
 
 const AUTO_BIN_SIZE_BP: i32 = 5_000_000;
+const AUTO_BIN_MIN_SIZE_BP: i32 = 500_000;
+const AUTO_BIN_TARGET_TASKS_PER_THREAD: usize = 4;
+const PARALLEL_CHUNK_CHANNEL_FACTOR: usize = 2;
+const PARALLEL_CHUNK_INITIAL_CAPACITY: usize = 512 * 1024;
+const PARALLEL_CHUNK_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelinePlan {
@@ -32,10 +38,24 @@ pub struct PipelinePlan {
 }
 
 #[derive(Debug)]
-struct RegionChunk {
+struct RegionChunkBuffer {
     index: usize,
     region: String,
-    chunk_file: NamedTempFile,
+    body: Vec<u8>,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+enum ParallelChunkMessage {
+    Ready(RegionChunkBuffer),
+}
+
+#[derive(Debug)]
+struct AutoBinnedRegions {
+    regions: Vec<String>,
+    bin_size_bp: i32,
+    covered_bases: u64,
+    target_bins: usize,
 }
 
 pub fn build_plan(args: &Bam2SeqzArgs) -> Result<PipelinePlan> {
@@ -72,11 +92,13 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
         if should_auto_bin_parallel(args) {
             let auto_regions = derive_auto_binned_regions(args, &base_tools, gc_intervals.as_ref())?;
             info!(
-                bins = auto_regions.len(),
-                bin_size_bp = AUTO_BIN_SIZE_BP,
+                bins = auto_regions.regions.len(),
+                bin_size_bp = auto_regions.bin_size_bp,
+                covered_bases = auto_regions.covered_bases,
+                target_bins = auto_regions.target_bins,
                 "running auto-binned parallel mode with ordered single output"
             );
-            return run_parallel_single_output(args, gc_intervals, auto_regions);
+            return run_parallel_single_output(args, gc_intervals, auto_regions.regions);
         }
 
         if args.parallel_single_output {
@@ -219,45 +241,85 @@ fn run_parallel_single_output(
         .map_err(|err| AppError::ParseError {
             message: format!("failed to initialize rayon thread pool: {err}"),
         })?;
-    let mut chunks: Vec<Option<RegionChunk>> = (0..work.len()).map(|_| None).collect();
+    let effective_parallelism = work.len().min(args.nproc);
+    info!(
+        regions = work.len(),
+        requested_threads = args.nproc,
+        effective_parallelism,
+        "starting parallel single-output run"
+    );
+    if effective_parallelism < args.nproc {
+        info!(
+            regions = work.len(),
+            requested_threads = args.nproc,
+            hint = "CPU utilization is bounded by available region tasks; use smaller bins or more regions to saturate threads",
+            "parallel task shape may limit CPU saturation"
+        );
+    }
 
-    if !args.pileup && args.bam_backend == BamBackend::RustHtslib {
+    let channel_capacity = (args.nproc * PARALLEL_CHUNK_CHANNEL_FACTOR).max(4);
+    let (chunk_sender, chunk_receiver) = bounded::<ParallelChunkMessage>(channel_capacity);
+    let (recycle_sender, recycle_receiver) = bounded::<Vec<u8>>(channel_capacity);
+    for _ in 0..channel_capacity {
+        let _ = recycle_sender.send(Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY));
+    }
+
+    let writer_tools = ExternalTools::from_args(args);
+    let writer_output = args.out.clone();
+    let expected_chunks = work.len();
+    let writer_started = Instant::now();
+    let writer_handle = thread::spawn(move || {
+        write_ordered_parallel_output(
+            &writer_output,
+            &writer_tools,
+            expected_chunks,
+            chunk_receiver,
+            recycle_sender,
+        )
+    });
+
+    let workers_started = Instant::now();
+    let worker_result = if !args.pileup && args.bam_backend == BamBackend::RustHtslib {
         #[cfg(feature = "htslib-prototype")]
         {
-            let chunk_results = pool.install(|| {
-                work.par_iter()
-                    .map_init(
-                        || crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
-                        |context, (index, region)| -> Result<RegionChunk> {
-                            let tools = ExternalTools::from_args(args);
-                            let chunk_file = Builder::new()
-                                .prefix("bam2seqz_parallel_chunk_")
-                                .suffix(".seqz")
-                                .tempfile_in("tmp")?;
-                            let chunk_path = chunk_file.path().to_string_lossy().into_owned();
-                            run_one_with_htslib_context(
-                                args,
-                                &tools,
-                                context,
-                                std::slice::from_ref(region),
-                                &chunk_path,
-                                gc_intervals.as_ref(),
-                            )?;
-                            Ok(RegionChunk {
-                                index: *index,
-                                region: region.clone(),
-                                chunk_file,
-                            })
-                        },
-                    )
-                    .collect::<Vec<_>>()
-            });
-
-            for chunk_result in chunk_results {
-                let region_chunk = chunk_result?;
-                let index = region_chunk.index;
-                chunks[index] = Some(region_chunk);
-            }
+            pool.install(|| {
+                work.par_iter().try_for_each_init(
+                    || {
+                        (
+                            crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
+                            ExternalTools::from_args(args),
+                            chunk_sender.clone(),
+                            recycle_receiver.clone(),
+                        )
+                    },
+                    |(context, tools, tx, recycled), (index, region)| -> Result<()> {
+                        let mut body = take_recycled_buffer(recycled);
+                        let started = Instant::now();
+                        run_one_with_htslib_context_body_to_buffer(
+                            args,
+                            tools,
+                            context,
+                            region,
+                            gc_intervals.as_ref(),
+                            &mut body,
+                        )?;
+                        let chunk = RegionChunkBuffer {
+                            index: *index,
+                            region: region.clone(),
+                            body,
+                            elapsed: started.elapsed(),
+                        };
+                        tx.send(ParallelChunkMessage::Ready(chunk)).map_err(|err| {
+                            AppError::ParseError {
+                                message: format!(
+                                    "failed to send parallel region chunk for {}: {err}",
+                                    region
+                                ),
+                            }
+                        })
+                    },
+                )
+            })
         }
         #[cfg(not(feature = "htslib-prototype"))]
         {
@@ -270,80 +332,381 @@ fn run_parallel_single_output(
             });
         }
     } else {
-        let (sender, receiver) = unbounded::<Result<RegionChunk>>();
         pool.install(|| {
-            work.par_iter().for_each_with(sender, |tx, (index, region)| {
-                let result = (|| {
-                    let tools = ExternalTools::from_args(args);
-                    let chunk_file = Builder::new()
-                        .prefix("bam2seqz_parallel_chunk_")
-                        .suffix(".seqz")
-                        .tempfile_in("tmp")?;
-                    let chunk_path = chunk_file.path().to_string_lossy().into_owned();
-                    run_one(
-                        args,
-                        &tools,
-                        std::slice::from_ref(region),
-                        &chunk_path,
-                        gc_intervals.as_ref(),
-                    )?;
-                    Ok(RegionChunk {
+            work.par_iter().try_for_each_init(
+                || {
+                    (
+                        ExternalTools::from_args(args),
+                        chunk_sender.clone(),
+                        recycle_receiver.clone(),
+                    )
+                },
+                |(tools, tx, recycled), (index, region)| -> Result<()> {
+                    let mut body = take_recycled_buffer(recycled);
+                    let started = Instant::now();
+                    run_one_region_body_to_buffer(args, tools, region, gc_intervals.as_ref(), &mut body)?;
+                    let chunk = RegionChunkBuffer {
                         index: *index,
                         region: region.clone(),
-                        chunk_file,
+                        body,
+                        elapsed: started.elapsed(),
+                    };
+                    tx.send(ParallelChunkMessage::Ready(chunk)).map_err(|err| {
+                        AppError::ParseError {
+                            message: format!(
+                                "failed to send parallel region chunk for {}: {err}",
+                                region
+                            ),
+                        }
                     })
-                })();
-                let _ = tx.send(result);
-            });
-        });
+                },
+            )
+        })
+    };
+    let workers_elapsed = workers_started.elapsed();
+    drop(chunk_sender);
 
-        for _ in 0..work.len() {
-            let region_chunk = receiver.recv().map_err(|err| AppError::ParseError {
-                message: format!("failed to receive parallel region result: {err}"),
-            })??;
-            let index = region_chunk.index;
-            chunks[index] = Some(region_chunk);
+    let writer_result = writer_handle.join().map_err(|_| AppError::ParseError {
+        message: "parallel writer thread panicked".to_string(),
+    })?;
+    let writer_elapsed = writer_started.elapsed();
+
+    if let Err(error) = worker_result {
+        if let Err(writer_error) = writer_result {
+            info!(
+                worker_error = %error,
+                writer_error = %writer_error,
+                "parallel run failed in both worker and writer"
+            );
+        }
+        return Err(error);
+    }
+    writer_result?;
+
+    info!(
+        output = %args.out,
+        regions = work.len(),
+        worker_elapsed_ms = workers_elapsed.as_millis(),
+        writer_elapsed_ms = writer_elapsed.as_millis(),
+        "completed parallel single-output merge"
+    );
+    Ok(())
+}
+
+fn take_recycled_buffer(recycle_receiver: &Receiver<Vec<u8>>) -> Vec<u8> {
+    match recycle_receiver.try_recv() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            buffer
+        }
+        Err(TryRecvError::Empty) => {
+            debug!(
+                "recycle buffer pool empty; allocating a fresh chunk buffer to avoid worker stall"
+            );
+            Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY)
+        }
+        Err(TryRecvError::Disconnected) => {
+            debug!("recycle buffer channel disconnected; allocating a fresh chunk buffer");
+            Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY)
         }
     }
+}
 
-    let tools = ExternalTools::from_args(args);
-    writer::with_text_output_writer(&args.out, &tools, |out| {
+fn write_ordered_parallel_output(
+    output: &str,
+    tools: &ExternalTools,
+    expected_chunks: usize,
+    chunk_receiver: Receiver<ParallelChunkMessage>,
+    recycle_sender: Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut next_expected = 0usize;
+    let mut pending = HashMap::new();
+    let mut wait_cycles = 0u64;
+
+    writer::with_text_output_writer(output, tools, |out| {
         writer::write_seqz_header(out)?;
 
-        for (index, maybe_chunk) in chunks.into_iter().enumerate() {
-            let chunk = maybe_chunk.ok_or_else(|| AppError::ParseError {
-                message: format!("missing region chunk result for index {index}"),
-            })?;
-            info!(
-                region = %chunk.region,
-                chunk = %chunk.chunk_file.path().to_string_lossy(),
-                "merging ordered region chunk"
-            );
-
-            let mut reader = BufReader::new(chunk.chunk_file.reopen()?);
-            let mut line = String::new();
-            let mut skip_header = true;
-            loop {
-                line.clear();
-                let read = reader.read_line(&mut line)?;
-                if read == 0 {
-                    break;
+        while next_expected < expected_chunks {
+            let message = match chunk_receiver.recv_timeout(PARALLEL_CHUNK_RECV_TIMEOUT) {
+                Ok(message) => {
+                    wait_cycles = 0;
+                    message
                 }
-                if skip_header {
-                    skip_header = false;
+                Err(RecvTimeoutError::Timeout) => {
+                    wait_cycles += 1;
+                    warn!(
+                        next_expected,
+                        expected_chunks,
+                        pending_chunks = pending.len(),
+                        waited_seconds = wait_cycles * PARALLEL_CHUNK_RECV_TIMEOUT.as_secs(),
+                        "writer still waiting for next chunk"
+                    );
                     continue;
                 }
-                out.write_all(line.as_bytes())?;
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(AppError::ParseError {
+                        message: format!(
+                            "parallel writer channel closed before all chunks were received (next={next_expected}, expected={expected_chunks})"
+                        ),
+                    });
+                }
+            };
+
+            let ParallelChunkMessage::Ready(chunk) = message;
+            let index = chunk.index;
+            let _ = pending.insert(index, chunk);
+
+            while let Some(mut ordered_chunk) = pending.remove(&next_expected) {
+                info!(
+                    index = ordered_chunk.index,
+                    region = %ordered_chunk.region,
+                    chunk_bytes = ordered_chunk.body.len(),
+                    worker_elapsed_ms = ordered_chunk.elapsed.as_millis(),
+                    "merging ordered region chunk"
+                );
+                out.write_all(&ordered_chunk.body)?;
+                ordered_chunk.body.clear();
+                let _ = recycle_sender.try_send(ordered_chunk.body);
+                next_expected += 1;
             }
         }
         Ok(())
     })?;
 
-    if args.out.ends_with(".gz") {
-        info!(output = %args.out, "indexing compressed seqz with tabix");
-        tools.tabix_index_seqz(&args.out)?;
+    if output.ends_with(".gz") {
+        info!(output = %output, "indexing compressed seqz with tabix");
+        tools.tabix_index_seqz(output)?;
     }
-    info!(output = %args.out, "completed parallel single-output merge");
+
+    Ok(())
+}
+
+fn run_one_region_body_to_buffer(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    region: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if !region_overlaps_gc(gc_intervals, region) {
+        return Ok(());
+    }
+
+    let region_scope = [region.to_string()];
+    let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, &region_scope)?;
+    let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
+        Some(open_pileup_stream(args, tools, normal2_path, &region_scope)?)
+    } else {
+        None
+    };
+
+    let mut normal_stream = open_pileup_stream(args, tools, &args.normal, &region_scope)?;
+    let mut tumor_current = tumor_stream.next_record()?;
+    let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
+        stream.next_record()?
+    } else {
+        None
+    };
+
+    let params = SeqzParams {
+        depth_sum: args.depth_sum,
+        qlimit: args.qlimit_ascii().clamp(0, i32::from(u8::MAX)) as u8,
+        hom_t: args.hom,
+        het_t: args.het,
+        het_f: args.het_f,
+        het_only: false,
+    };
+
+    let mut normal_line = String::with_capacity(96);
+    let mut tumor_line = String::with_capacity(96);
+    let mut alt_line = String::with_capacity(96);
+
+    while let Some(normal) = normal_stream.next_record()? {
+        advance_to_target(&mut tumor_current, &mut tumor_stream, &normal)?;
+        let Some(tumor) = tumor_current.as_ref() else {
+            break;
+        };
+        if compare_coordinates(tumor, &normal) != Ordering::Equal {
+            continue;
+        }
+
+        let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
+            continue;
+        };
+
+        normal.write_data_line(&mut normal_line);
+        tumor.write_data_line(&mut tumor_line);
+
+        let seqz_fields = if let Some(stream) = alt_stream.as_mut() {
+            advance_to_target(&mut alt_current, stream, &normal)?;
+            if let Some(alt) = alt_current.as_ref() {
+                if compare_coordinates(alt, &normal) == Ordering::Equal {
+                    alt.write_data_line(&mut alt_line);
+                    do_seqz(
+                        &[
+                            normal_line.as_str(),
+                            tumor_line.as_str(),
+                            gc,
+                            alt_line.as_str(),
+                        ],
+                        &params,
+                    )
+                } else {
+                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                }
+            } else {
+                do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+            }
+        } else {
+            do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+        };
+
+        if let Some(seqz) = seqz_fields {
+            let _ = write!(out, "{}\t{}", normal.chromosome, normal.position);
+            for field in seqz {
+                out.write_all(b"\t")?;
+                out.write_all(field.as_bytes())?;
+            }
+            out.write_all(b"\n")?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "htslib-prototype")]
+fn run_one_with_htslib_context_body_to_buffer(
+    args: &Bam2SeqzArgs,
+    _tools: &ExternalTools,
+    context: &mut crate::htslib_mpileup::HtslibWorkerContext,
+    region: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let params = SeqzParams {
+        depth_sum: args.depth_sum,
+        qlimit: args.qlimit_ascii().clamp(0, i32::from(u8::MAX)) as u8,
+        hom_t: args.hom,
+        het_t: args.het,
+        het_f: args.het_f,
+        het_only: false,
+    };
+
+    let region_value = region.to_string();
+    let mut resolved_regions = context.resolve_regions(std::slice::from_ref(&region_value))?;
+    resolved_regions = filter_regions_with_gc(&resolved_regions, gc_intervals);
+    if resolved_regions.is_empty() {
+        return Ok(());
+    }
+
+    let mut normal_line = String::with_capacity(96);
+    let mut tumor_line = String::with_capacity(96);
+    let mut alt_line = String::with_capacity(96);
+
+    for region_spec_text in resolved_regions {
+        let mut readers = context.readers_mut()?;
+        let region_spec = crate::htslib_mpileup::parse_region_spec(readers.tumor, &region_spec_text)?;
+        let reference_bases =
+            crate::htslib_mpileup::fetch_reference_bases(readers.fasta, &region_spec)?;
+
+        crate::htslib_mpileup::fetch_region(readers.normal, &region_spec)?;
+        crate::htslib_mpileup::fetch_region(readers.tumor, &region_spec)?;
+        if let Some(reader) = readers.normal2.as_deref_mut() {
+            crate::htslib_mpileup::fetch_region(reader, &region_spec)?;
+        }
+
+        let mut normal_iter = readers.normal.pileup();
+        let mut tumor_iter = readers.tumor.pileup();
+        let mut alt_iter = readers.normal2.as_deref_mut().map(|reader| reader.pileup());
+
+        let mut tumor_current = crate::htslib_mpileup::next_record_from_pileups(
+            &mut tumor_iter,
+            &region_spec,
+            &reference_bases,
+        )?;
+        let mut alt_current = if let Some(iter) = alt_iter.as_mut() {
+            crate::htslib_mpileup::next_record_from_pileups(iter, &region_spec, &reference_bases)?
+        } else {
+            None
+        };
+
+        while let Some(normal) = crate::htslib_mpileup::next_record_from_pileups(
+            &mut normal_iter,
+            &region_spec,
+            &reference_bases,
+        )? {
+            while let Some(tumor) = tumor_current.as_ref() {
+                if compare_htslib_coordinates(tumor, &normal) == Ordering::Less {
+                    tumor_current = crate::htslib_mpileup::next_record_from_pileups(
+                        &mut tumor_iter,
+                        &region_spec,
+                        &reference_bases,
+                    )?;
+                    continue;
+                }
+                break;
+            }
+
+            let Some(tumor) = tumor_current.as_ref() else {
+                break;
+            };
+            if compare_htslib_coordinates(tumor, &normal) != Ordering::Equal {
+                continue;
+            }
+
+            let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
+                continue;
+            };
+
+            normal.write_data_line(&mut normal_line);
+            tumor.write_data_line(&mut tumor_line);
+
+            let seqz_fields = if let Some(iter) = alt_iter.as_mut() {
+                while let Some(alt) = alt_current.as_ref() {
+                    if compare_htslib_coordinates(alt, &normal) == Ordering::Less {
+                        alt_current = crate::htslib_mpileup::next_record_from_pileups(
+                            iter,
+                            &region_spec,
+                            &reference_bases,
+                        )?;
+                        continue;
+                    }
+                    break;
+                }
+
+                if let Some(alt) = alt_current.as_ref() {
+                    if compare_htslib_coordinates(alt, &normal) == Ordering::Equal {
+                        alt.write_data_line(&mut alt_line);
+                        do_seqz(
+                            &[
+                                normal_line.as_str(),
+                                tumor_line.as_str(),
+                                gc,
+                                alt_line.as_str(),
+                            ],
+                            &params,
+                        )
+                    } else {
+                        do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                    }
+                } else {
+                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                }
+            } else {
+                do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+            };
+
+            if let Some(seqz) = seqz_fields {
+                let _ = write!(out, "{}\t{}", normal.chromosome, normal.position);
+                for field in seqz {
+                    out.write_all(b"\t")?;
+                    out.write_all(field.as_bytes())?;
+                }
+                out.write_all(b"\n")?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -355,15 +718,53 @@ fn derive_auto_binned_regions(
     args: &Bam2SeqzArgs,
     tools: &ExternalTools,
     gc_intervals: &HashMap<String, Vec<GcInterval>>,
-) -> Result<Vec<String>> {
+) -> Result<AutoBinnedRegions> {
     let chromosomes = if args.chr.is_empty() {
         tools.list_bam_chromosomes(&args.tumor)?
     } else {
         dedup_chromosomes_preserving_order(&args.chr)
     };
 
-    let bins = auto_bin_regions_for_chromosomes(&chromosomes, gc_intervals, AUTO_BIN_SIZE_BP);
-    Ok(filter_regions_with_gc(&bins, gc_intervals))
+    let covered_bases = estimate_gc_covered_bases(&chromosomes, gc_intervals);
+    let target_bins = (args.nproc * AUTO_BIN_TARGET_TASKS_PER_THREAD).max(args.nproc);
+    let bin_size_bp = choose_auto_bin_size_bp(covered_bases, target_bins);
+
+    let bins = auto_bin_regions_for_chromosomes(&chromosomes, gc_intervals, bin_size_bp);
+    let regions = filter_regions_with_gc(&bins, gc_intervals);
+
+    Ok(AutoBinnedRegions {
+        regions,
+        bin_size_bp,
+        covered_bases,
+        target_bins,
+    })
+}
+
+fn estimate_gc_covered_bases(
+    chromosomes: &[String],
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+) -> u64 {
+    chromosomes
+        .iter()
+        .filter_map(|chromosome| gc_intervals.get(chromosome))
+        .flat_map(|intervals| intervals.iter())
+        .filter(|interval| interval.end > interval.start)
+        .map(|interval| u64::try_from(interval.end - interval.start).unwrap_or(0))
+        .sum()
+}
+
+fn choose_auto_bin_size_bp(covered_bases: u64, target_bins: usize) -> i32 {
+    if covered_bases == 0 || target_bins == 0 {
+        return AUTO_BIN_SIZE_BP;
+    }
+
+    let target_bins_u64 = u64::try_from(target_bins).unwrap_or(1);
+    let raw = covered_bases.div_ceil(target_bins_u64);
+    let clamped = raw.clamp(
+        u64::try_from(AUTO_BIN_MIN_SIZE_BP).unwrap_or(1),
+        u64::try_from(AUTO_BIN_SIZE_BP).unwrap_or(5_000_000),
+    );
+    i32::try_from(clamped).unwrap_or(AUTO_BIN_SIZE_BP)
 }
 
 fn dedup_chromosomes_preserving_order(chromosomes: &[String]) -> Vec<String> {
@@ -1756,5 +2157,20 @@ mod tests {
                 "chr1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn adaptive_auto_bin_shrinks_for_small_coverage() {
+        let covered = 60_000_000_u64;
+        let bin_size = super::choose_auto_bin_size_bp(covered, 64);
+        assert!(bin_size < super::AUTO_BIN_SIZE_BP);
+        assert!(bin_size >= super::AUTO_BIN_MIN_SIZE_BP);
+    }
+
+    #[test]
+    fn adaptive_auto_bin_keeps_default_for_large_coverage() {
+        let covered = 3_000_000_000_u64;
+        let bin_size = super::choose_auto_bin_size_bp(covered, 64);
+        assert_eq!(bin_size, super::AUTO_BIN_SIZE_BP);
     }
 }

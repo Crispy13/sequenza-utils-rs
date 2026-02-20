@@ -427,7 +427,7 @@ fn index_to_base(index: usize) -> char {
 }
 
 fn py_str_round3(value: f64) -> String {
-    let rounded = (value * 1000.0).round() / 1000.0;
+    let rounded = (value * 1000.0).round_ties_even() / 1000.0;
     if (rounded.fract()).abs() < f64::EPSILON {
         return format!("{rounded:.1}");
     }
@@ -443,7 +443,7 @@ fn py_str_round3(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SeqzParams, do_seqz, seqz_header};
+    use super::{SeqzParams, do_seqz, py_str_round3, seqz_header};
 
     #[test]
     fn seqz_header_shape_matches_python() {
@@ -474,5 +474,13 @@ mod tests {
         assert_eq!(line_alt[9], "T");
         assert_eq!(line_alt[10], "C0.788");
         assert_eq!(line_alt[11], "C0.231");
+    }
+
+    #[test]
+    fn py_round3_matches_python_ties_to_even() {
+        assert_eq!(py_str_round3(77.0 / 16.0), "4.812");
+        assert_eq!(py_str_round3(81.0 / 16.0), "5.062");
+        assert_eq!(py_str_round3(89.0 / 16.0), "5.562");
+        assert_eq!(py_str_round3(1.0), "1.0");
     }
 }
