@@ -1118,6 +1118,8 @@ impl Drop for PileupStream {
 #[derive(Debug, Clone)]
 struct PileupRecord {
     chromosome: String,
+    chromosome_group: u8,
+    chromosome_rank: u32,
     position: i32,
     reference: String,
     depth: i32,
@@ -1139,61 +1141,140 @@ impl PileupRecord {
 }
 
 fn parse_pileup_record(line: &[u8]) -> Result<PileupRecord> {
-    let parts = line.splitn(6, |byte| *byte == b'\t').collect::<Vec<_>>();
-    if parts.len() < 6 {
-        return Err(AppError::ParseError {
-            message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
-        });
-    }
+    let mut parts = line.splitn(6, |byte| *byte == b'\t');
+    let chromosome_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
+    let position_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
+    let reference_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
+    let depth_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
+    let pileup_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
+    let quality_part = parts.next().ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
+    })?;
 
-    let position = parse_i32_ascii(parts[1]).ok_or_else(|| AppError::ParseError {
+    let position = parse_i32_ascii(position_part).ok_or_else(|| AppError::ParseError {
         message: format!(
             "invalid pileup position: {}",
-            String::from_utf8_lossy(parts[1])
+            String::from_utf8_lossy(position_part)
         ),
     })?;
-    let depth = parse_i32_ascii(parts[3]).ok_or_else(|| AppError::ParseError {
-        message: format!("invalid pileup depth: {}", String::from_utf8_lossy(parts[3])),
+    let depth = parse_i32_ascii(depth_part).ok_or_else(|| AppError::ParseError {
+        message: format!("invalid pileup depth: {}", String::from_utf8_lossy(depth_part)),
     })?;
+    let chromosome = decode_field(chromosome_part);
+    let (chromosome_group, chromosome_rank) = chromosome_sort_class(&chromosome);
 
     Ok(PileupRecord {
-        chromosome: String::from_utf8_lossy(parts[0]).into_owned(),
+        chromosome,
+        chromosome_group,
+        chromosome_rank,
         position,
-        reference: String::from_utf8_lossy(parts[2]).into_owned(),
+        reference: decode_field(reference_part),
         depth,
-        pileup: String::from_utf8_lossy(parts[4]).into_owned(),
-        quality: String::from_utf8_lossy(parts[5]).into_owned(),
+        pileup: decode_field(pileup_part),
+        quality: decode_field(quality_part),
     })
 }
 
+fn decode_field(field: &[u8]) -> String {
+    match std::str::from_utf8(field) {
+        Ok(text) => text.to_owned(),
+        Err(_) => String::from_utf8_lossy(field).into_owned(),
+    }
+}
+
 fn compare_coordinates(left: &PileupRecord, right: &PileupRecord) -> Ordering {
-    match compare_chromosomes(&left.chromosome, &right.chromosome) {
+    match compare_chromosome_keys(
+        left.chromosome_group,
+        left.chromosome_rank,
+        &left.chromosome,
+        right.chromosome_group,
+        right.chromosome_rank,
+        &right.chromosome,
+    ) {
         Ordering::Equal => left.position.cmp(&right.position),
         other => other,
     }
 }
 
+#[cfg(feature = "htslib-prototype")]
 fn compare_chromosomes(left: &str, right: &str) -> Ordering {
-    let left_key = chromosome_sort_key(left);
-    let right_key = chromosome_sort_key(right);
-    left_key.cmp(&right_key)
+    let (left_group, left_rank) = chromosome_sort_class(left);
+    let (right_group, right_rank) = chromosome_sort_class(right);
+    compare_chromosome_keys(left_group, left_rank, left, right_group, right_rank, right)
 }
 
-fn chromosome_sort_key(chrom: &str) -> (u8, u32, &str) {
+fn compare_chromosome_keys(
+    left_group: u8,
+    left_rank: u32,
+    left: &str,
+    right_group: u8,
+    right_rank: u32,
+    right: &str,
+) -> Ordering {
+    match left_group.cmp(&right_group) {
+        Ordering::Equal => match left_rank.cmp(&right_rank) {
+            Ordering::Equal => left.cmp(right),
+            other => other,
+        },
+        other => other,
+    }
+}
+
+fn chromosome_sort_class(chrom: &str) -> (u8, u32) {
     let raw = chrom.trim();
-    let normalized = raw.strip_prefix("chr").unwrap_or(raw);
-    let upper = normalized.to_ascii_uppercase();
+    let normalized = strip_chr_prefix(raw);
 
-    if let Ok(num) = upper.parse::<u32>() {
-        return (0, num, raw);
+    if let Some(num) = parse_u32_ascii_fast(normalized.as_bytes()) {
+        return (0, num);
     }
 
-    match upper.as_str() {
-        "X" => (1, 23, raw),
-        "Y" => (1, 24, raw),
-        "M" | "MT" => (1, 25, raw),
-        _ => (2, 0, raw),
+    if normalized.eq_ignore_ascii_case("X") {
+        (1, 23)
+    } else if normalized.eq_ignore_ascii_case("Y") {
+        (1, 24)
+    } else if normalized.eq_ignore_ascii_case("M") || normalized.eq_ignore_ascii_case("MT") {
+        (1, 25)
+    } else {
+        (2, 0)
     }
+}
+
+fn strip_chr_prefix(raw: &str) -> &str {
+    if raw.len() >= 3 {
+        let bytes = raw.as_bytes();
+        if bytes[0].eq_ignore_ascii_case(&b'c')
+            && bytes[1].eq_ignore_ascii_case(&b'h')
+            && bytes[2].eq_ignore_ascii_case(&b'r')
+        {
+            return &raw[3..];
+        }
+    }
+    raw
+}
+
+fn parse_u32_ascii_fast(raw: &[u8]) -> Option<u32> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut value: u32 = 0;
+    for &byte in raw {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
 }
 
 fn advance_to_target(
