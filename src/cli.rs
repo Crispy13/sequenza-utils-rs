@@ -179,7 +179,12 @@ impl Bam2SeqzArgs {
                 });
             }
         }
-        if self.nproc > 1 && self.out == "-" {
+        let uses_parallel_multi_output =
+            self.nproc > 1
+                && !self.parallel_single_output
+                && (self.pileup || self.has_explicit_ranged_regions());
+
+        if uses_parallel_multi_output && self.out == "-" {
             return Err(AppError::InvalidValue {
                 flag: "--output".to_string(),
                 value: "-".to_string(),
@@ -362,8 +367,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parallel_stdout() {
-        let result = parse_args([
+    fn accepts_parallel_stdout_for_auto_binned_mode() {
+        let args = parse_args([
             "bam2seqz",
             "-n",
             "n.bam",
@@ -380,7 +385,34 @@ mod tests {
             "2",
             "-o",
             "-",
+        ])
+        .expect("expected parse success");
+
+        assert_eq!(args.nproc, 2);
+        assert_eq!(args.out, "-");
+    }
+
+    #[test]
+    fn rejects_parallel_multi_output_stdout() {
+        let result = parse_args([
+            "bam2seqz",
+            "-n",
+            "n.bam",
+            "-t",
+            "t.bam",
+            "-gc",
+            "gc.wig",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr20:1-100",
+            "chr20:101-200",
+            "--parallel",
+            "2",
+            "-o",
+            "-",
         ]);
+
         assert!(result.is_err());
     }
 
@@ -468,6 +500,33 @@ mod tests {
         .expect("expected parse success");
 
         assert!(args.parallel_single_output);
+    }
+
+    #[test]
+    fn accepts_parallel_single_output_stdout() {
+        let args = parse_args([
+            "bam2seqz",
+            "-n",
+            "normal.bam",
+            "-t",
+            "tumor.bam",
+            "-gc",
+            "gc.wig.gz",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr20:1-100",
+            "chr20:101-200",
+            "--parallel",
+            "2",
+            "--parallel-single-output",
+            "-o",
+            "-",
+        ])
+        .expect("expected parse success");
+
+        assert!(args.parallel_single_output);
+        assert_eq!(args.out, "-");
     }
 
     #[test]
