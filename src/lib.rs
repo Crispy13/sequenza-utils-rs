@@ -10,7 +10,7 @@ pub mod writer;
 use cli::Bam2SeqzArgs;
 use errors::Result;
 use std::sync::Once;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::time::ChronoLocal};
 
 static TRACING_INIT: Once = Once::new();
 
@@ -19,8 +19,10 @@ pub fn init_tracing() {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_timer(ChronoLocal::rfc_3339())
             .with_target(false)
             .with_writer(std::io::stderr)
+            .with_ansi(false)
             .try_init();
     });
 }

@@ -14,7 +14,7 @@ indicatif = "0.17"
 rayon = "1"
 crossbeam-channel = "0.5"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter", "fmt"] }
 rust-htslib = { version = "1.0", features = ["libdeflate"], optional = true }
 bio = { version = "2", optional = true }
 mimalloc = { version = "0.1.48", features = ["secure"], optional = true }
