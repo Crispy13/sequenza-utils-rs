@@ -17,10 +17,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rust-htslib = { version = "1.0", features = ["libdeflate"], optional = true }
 bio = { version = "2", optional = true }
-mimalloc = { version = "0.1.48", features = ["secure"] }
+mimalloc = { version = "0.1.48", features = ["secure"], optional = true }
 
 [features]
-default = []
+default = ["mimalloc-allocator"]
+mimalloc-allocator = ["dep:mimalloc"]
 htslib-prototype = ["dep:rust-htslib", "dep:bio"]
 
 [lib]

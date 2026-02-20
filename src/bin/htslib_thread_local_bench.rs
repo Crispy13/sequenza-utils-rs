@@ -1,5 +1,6 @@
 use bio::io::fasta;
 use clap::Parser;
+#[cfg(feature = "mimalloc-allocator")]
 use mimalloc::MiMalloc;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
@@ -8,6 +9,7 @@ use rust_htslib::bam::Read;
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[cfg(feature = "mimalloc-allocator")]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

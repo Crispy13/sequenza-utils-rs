@@ -85,8 +85,8 @@ copy_if_exists "tmp/backend_bench_p8/details.tsv" "$OUT_DIR/backend_bench_p8_det
 copy_if_exists "tmp/backend_bench_p8/comparison.txt" "$OUT_DIR/backend_bench_p8_comparison.txt"
 
 if git rev-parse --verify "$TAG" >/dev/null 2>&1; then
-  COMMIT_SHA="$(git rev-parse "$TAG")"
-  RELEASE_DATE="$(git show -s --format=%cI "$TAG")"
+  COMMIT_SHA="$(git rev-parse "${TAG}^{}")"
+  RELEASE_DATE="$(git show -s --format=%cI "${TAG}^{}")"
 else
   COMMIT_SHA="$(git rev-parse HEAD)"
   RELEASE_DATE="$(git show -s --format=%cI HEAD)"
