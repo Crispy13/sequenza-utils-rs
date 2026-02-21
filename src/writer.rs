@@ -1,11 +1,10 @@
 use std::fs::File;
 use std::io::{BufWriter, Write, stdout};
-use std::path::Path;
+use std::process::{Command, Stdio};
 
 use crate::errors::Result;
 use crate::external_tools::ExternalTools;
 use crate::seqz_core::seqz_header;
-use tempfile::Builder;
 
 pub fn write_seqz_header<W: Write + ?Sized>(writer: &mut W) -> Result<()> {
     writer.write_all(seqz_header().join("\t").as_bytes())?;
@@ -14,6 +13,18 @@ pub fn write_seqz_header<W: Write + ?Sized>(writer: &mut W) -> Result<()> {
 }
 
 pub fn with_text_output_writer<F>(path: &str, tools: &ExternalTools, write_fn: F) -> Result<()>
+where
+    F: FnOnce(&mut dyn Write) -> Result<()>,
+{
+    with_text_output_writer_with_threads(path, tools, 1, write_fn)
+}
+
+pub fn with_text_output_writer_with_threads<F>(
+    path: &str,
+    tools: &ExternalTools,
+    compression_threads: usize,
+    write_fn: F,
+) -> Result<()>
 where
     F: FnOnce(&mut dyn Write) -> Result<()>,
 {
@@ -28,24 +39,48 @@ where
     }
 
     if path.ends_with(".gz") {
-        let output_path = Path::new(path);
-        let parent_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut plain_file = Builder::new()
-            .prefix("bam2seqz_")
-            .suffix(".tmp_plain")
-            .tempfile_in(parent_dir)?;
+        let output_file = File::create(path)?;
+        let mut command = Command::new(tools.bgzip());
+        command.arg("-c");
+        if compression_threads > 1 {
+            command
+                .arg("-@")
+                .arg(compression_threads.to_string());
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(output_file));
+
+        let mut child = command.spawn().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("required command not found in PATH: {}", tools.bgzip()),
+                )
+            } else {
+                err
+            }
+        })?;
 
         {
-            let mut buf = BufWriter::new(plain_file.as_file_mut());
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("failed to open bgzip stdin"))?;
             let run = write_fn
                 .take()
                 .ok_or_else(|| std::io::Error::other("writer callback already consumed"))?;
-            run(&mut buf)?;
-            buf.flush()?;
+            run(&mut stdin)?;
+            stdin.flush()?;
         }
 
-        let plain_path = plain_file.path().to_string_lossy().into_owned();
-        tools.bgzip_compress_to(&plain_path, path)?;
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "bgzip compression failed with status: {status}"
+            ))
+            .into());
+        }
         return Ok(());
     }
 

@@ -243,6 +243,7 @@ impl ExternalTools {
         bam: &str,
         fasta: &str,
         region: Option<&str>,
+        target_bed: Option<&str>,
     ) -> Result<CommandStream> {
         let stderr_capture = Builder::new()
             .prefix("bam2seqz_cmd_stderr_")
@@ -260,12 +261,27 @@ impl ExternalTools {
             .arg("-Q")
             .arg("20");
 
+        if let Some(path) = target_bed {
+            command.arg("-l").arg(path);
+        }
+
         let command_label = if let Some(value) = region {
             command.arg("-r").arg(value).arg(bam);
-            format!("{} mpileup -r {} {}", self.samtools, value, bam)
+            if let Some(path) = target_bed {
+                format!(
+                    "{} mpileup -l {} -r {} {}",
+                    self.samtools, path, value, bam
+                )
+            } else {
+                format!("{} mpileup -r {} {}", self.samtools, value, bam)
+            }
         } else {
             command.arg(bam);
-            format!("{} mpileup {}", self.samtools, bam)
+            if let Some(path) = target_bed {
+                format!("{} mpileup -l {} {}", self.samtools, path, bam)
+            } else {
+                format!("{} mpileup {}", self.samtools, bam)
+            }
         };
         info!(command = %command_label, "spawning mpileup stream");
 

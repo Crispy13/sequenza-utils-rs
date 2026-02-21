@@ -19,7 +19,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 use tracing::{debug, info, warn};
 
 const AUTO_BIN_SIZE_BP: i32 = 5_000_000;
@@ -267,12 +267,14 @@ fn run_parallel_single_output(
     let writer_tools = ExternalTools::from_args(args);
     let writer_output = args.out.clone();
     let expected_chunks = work.len();
+    let compression_threads = args.nproc.max(1);
     let writer_started = Instant::now();
     let writer_handle = thread::spawn(move || {
         write_ordered_parallel_output(
             &writer_output,
             &writer_tools,
             expected_chunks,
+            compression_threads,
             chunk_receiver,
             recycle_sender,
         )
@@ -416,6 +418,7 @@ fn write_ordered_parallel_output(
     output: &str,
     tools: &ExternalTools,
     expected_chunks: usize,
+    compression_threads: usize,
     chunk_receiver: Receiver<ParallelChunkMessage>,
     recycle_sender: Sender<Vec<u8>>,
 ) -> Result<()> {
@@ -423,7 +426,11 @@ fn write_ordered_parallel_output(
     let mut pending = HashMap::new();
     let mut wait_cycles = 0u64;
 
-    writer::with_text_output_writer(output, tools, |out| {
+    writer::with_text_output_writer_with_threads(
+        output,
+        tools,
+        compression_threads,
+        |out| {
         writer::write_seqz_header(out)?;
 
         while next_expected < expected_chunks {
@@ -493,14 +500,37 @@ fn run_one_region_body_to_buffer(
     }
 
     let region_scope = [region.to_string()];
-    let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, &region_scope)?;
+    let gc_target_bed = create_gc_target_bed_for_regions(&region_scope, gc_intervals)?;
+    let gc_target_path = gc_target_bed
+        .as_ref()
+        .map(|bed| bed.path().to_string_lossy().into_owned());
+
+    let mut tumor_stream = open_pileup_stream(
+        args,
+        tools,
+        &args.tumor,
+        &region_scope,
+        gc_target_path.as_deref(),
+    )?;
     let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
-        Some(open_pileup_stream(args, tools, normal2_path, &region_scope)?)
+        Some(open_pileup_stream(
+            args,
+            tools,
+            normal2_path,
+            &region_scope,
+            gc_target_path.as_deref(),
+        )?)
     } else {
         None
     };
 
-    let mut normal_stream = open_pileup_stream(args, tools, &args.normal, &region_scope)?;
+    let mut normal_stream = open_pileup_stream(
+        args,
+        tools,
+        &args.normal,
+        &region_scope,
+        gc_target_path.as_deref(),
+    )?;
     let mut tumor_current = tumor_stream.next_record()?;
     let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
         stream.next_record()?
@@ -890,14 +920,37 @@ fn run_one(
         }
     }
 
-    let mut tumor_stream = open_pileup_stream(args, tools, &args.tumor, region_scope)?;
+    let gc_target_bed = create_gc_target_bed_for_regions(region_scope, gc_intervals)?;
+    let gc_target_path = gc_target_bed
+        .as_ref()
+        .map(|bed| bed.path().to_string_lossy().into_owned());
+
+    let mut tumor_stream = open_pileup_stream(
+        args,
+        tools,
+        &args.tumor,
+        region_scope,
+        gc_target_path.as_deref(),
+    )?;
     let mut alt_stream = if let Some(normal2_path) = &args.normal2 {
-        Some(open_pileup_stream(args, tools, normal2_path, region_scope)?)
+        Some(open_pileup_stream(
+            args,
+            tools,
+            normal2_path,
+            region_scope,
+            gc_target_path.as_deref(),
+        )?)
     } else {
         None
     };
 
-    let mut normal_stream = open_pileup_stream(args, tools, &args.normal, region_scope)?;
+    let mut normal_stream = open_pileup_stream(
+        args,
+        tools,
+        &args.normal,
+        region_scope,
+        gc_target_path.as_deref(),
+    )?;
     let mut tumor_current = tumor_stream.next_record()?;
     let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
         stream.next_record()?
@@ -1266,6 +1319,7 @@ fn open_pileup_stream(
     tools: &ExternalTools,
     input_path: &str,
     regions: &[String],
+    gc_target_bed: Option<&str>,
 ) -> Result<PileupStream> {
     if args.pileup {
         info!(input = %input_path, regions = regions.len(), "opening pileup input stream");
@@ -1287,10 +1341,17 @@ fn open_pileup_stream(
                 info!(
                     input = %input_path,
                     regions = regions.len(),
+                    gc_target_bed = gc_target_bed.is_some(),
                     backend = "samtools",
                     "opening BAM mpileup stream"
                 );
-                PileupStream::from_bam_mpileup_stream(tools, input_path, fasta, regions)
+                PileupStream::from_bam_mpileup_stream(
+                    tools,
+                    input_path,
+                    fasta,
+                    regions,
+                    gc_target_bed,
+                )
             }
             BamBackend::RustHtslib => Err(AppError::ParseError {
                 message:
@@ -1322,15 +1383,23 @@ struct RegionStreamSource {
     tools: ExternalTools,
     bam: String,
     fasta: String,
+    target_bed: Option<String>,
     pending_regions: VecDeque<String>,
 }
 
 impl RegionStreamSource {
-    fn new(tools: ExternalTools, bam: String, fasta: String, regions: &[String]) -> Self {
+    fn new(
+        tools: ExternalTools,
+        bam: String,
+        fasta: String,
+        regions: &[String],
+        target_bed: Option<&str>,
+    ) -> Self {
         Self {
             tools,
             bam,
             fasta,
+            target_bed: target_bed.map(str::to_string),
             pending_regions: regions.iter().cloned().collect(),
         }
     }
@@ -1341,7 +1410,12 @@ impl RegionStreamSource {
         };
         info!(region = %region, "spawning next region mpileup stream");
         self.tools
-            .spawn_samtools_mpileup_stream(&self.bam, &self.fasta, Some(region.as_str()))
+            .spawn_samtools_mpileup_stream(
+                &self.bam,
+                &self.fasta,
+                Some(region.as_str()),
+                self.target_bed.as_deref(),
+            )
             .map(Some)
     }
 }
@@ -1396,14 +1470,20 @@ impl PileupStream {
         bam: &str,
         fasta: &str,
         regions: &[String],
+        target_bed: Option<&str>,
     ) -> Result<Self> {
         if regions.is_empty() {
-            let stream = tools.spawn_samtools_mpileup_stream(bam, fasta, None)?;
+            let stream = tools.spawn_samtools_mpileup_stream(bam, fasta, None, target_bed)?;
             return Self::from_command_stream(stream);
         }
 
-        let mut source =
-            RegionStreamSource::new(tools.clone(), bam.to_string(), fasta.to_string(), regions);
+        let mut source = RegionStreamSource::new(
+            tools.clone(),
+            bam.to_string(),
+            fasta.to_string(),
+            regions,
+            target_bed,
+        );
         let first = source.spawn_next()?.ok_or_else(|| AppError::ParseError {
             message: "failed to initialize region mpileup stream".to_string(),
         })?;
@@ -1947,6 +2027,114 @@ fn parse_region_bounds(region: &str) -> Option<(i32, i32)> {
     let start = start_raw.replace(',', "").parse::<i32>().ok()?;
     let end = end_raw.replace(',', "").parse::<i32>().ok()?;
     (end >= start).then_some((start, end))
+}
+
+fn create_gc_target_bed_for_regions(
+    regions: &[String],
+    gc_map: &HashMap<String, Vec<GcInterval>>,
+) -> Result<Option<NamedTempFile>> {
+    let mut by_chromosome: HashMap<String, Vec<(i32, i32)>> = HashMap::new();
+
+    if regions.is_empty() {
+        for (chromosome, intervals) in gc_map {
+            let targets = by_chromosome.entry(chromosome.clone()).or_default();
+            for interval in intervals {
+                if interval.end > interval.start {
+                    targets.push((interval.start, interval.end));
+                }
+            }
+        }
+    } else {
+        for region in regions {
+            let chromosome = region_chromosome(region);
+            let Some(intervals) = gc_map.get(chromosome) else {
+                continue;
+            };
+
+            let targets = by_chromosome.entry(chromosome.to_string()).or_default();
+            if let Some((region_start, region_end_inclusive)) = parse_region_bounds(region) {
+                let region_end_exclusive = region_end_inclusive.saturating_add(1);
+                let start_index = intervals.partition_point(|interval| interval.end <= region_start);
+                for interval in intervals[start_index..]
+                    .iter()
+                    .take_while(|interval| interval.start < region_end_exclusive)
+                {
+                    let overlap_start = interval.start.max(region_start);
+                    let overlap_end = interval.end.min(region_end_exclusive);
+                    if overlap_end > overlap_start {
+                        targets.push((overlap_start, overlap_end));
+                    }
+                }
+            } else {
+                for interval in intervals {
+                    if interval.end > interval.start {
+                        targets.push((interval.start, interval.end));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut total_intervals = 0usize;
+    for intervals in by_chromosome.values_mut() {
+        if intervals.is_empty() {
+            continue;
+        }
+        intervals.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+
+        let mut merged: Vec<(i32, i32)> = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals.iter().copied() {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            } else {
+                merged.push((start, end));
+            }
+        }
+        total_intervals += merged.len();
+        *intervals = merged;
+    }
+
+    if total_intervals == 0 {
+        return Ok(None);
+    }
+
+    let mut chromosome_names = by_chromosome.keys().cloned().collect::<Vec<_>>();
+    chromosome_names.sort();
+
+    let mut bed_file = Builder::new()
+        .prefix("bam2seqz_gc_targets_")
+        .suffix(".bed")
+        .tempfile_in("tmp")?;
+    {
+        let out = bed_file.as_file_mut();
+        for chromosome in chromosome_names {
+            if let Some(intervals) = by_chromosome.get(&chromosome) {
+                for (start, end) in intervals {
+                    let bed_start = start.saturating_sub(1).max(0);
+                    let bed_end = end.saturating_sub(1).max(bed_start + 1);
+                    writeln!(out, "{chromosome}\t{bed_start}\t{bed_end}")?;
+                }
+            }
+        }
+        out.flush()?;
+    }
+
+    info!(
+        regions = regions.len(),
+        chromosomes = by_chromosome.len(),
+        intervals = total_intervals,
+        path = %bed_file.path().to_string_lossy(),
+        "prepared GC target bed for mpileup"
+    );
+    Ok(Some(bed_file))
 }
 
 fn region_chromosome(region: &str) -> &str {
