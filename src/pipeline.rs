@@ -3,7 +3,7 @@ use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
 use crate::seqz_core::{SeqzParams, do_seqz};
 use crate::writer;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::ThreadPoolBuilder;
@@ -13,14 +13,14 @@ use rust_htslib::bam::Read as _;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdout};
 use std::process::Child;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{Builder, NamedTempFile};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const AUTO_BIN_SIZE_BP: i32 = 5_000_000;
 const AUTO_BIN_MIN_SIZE_BP: i32 = 500_000;
@@ -41,7 +41,7 @@ pub struct PipelinePlan {
 struct RegionChunkBuffer {
     index: usize,
     region: String,
-    body: Vec<u8>,
+    tempfile: NamedTempFile,
     elapsed: Duration,
 }
 
@@ -168,18 +168,15 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
                         || crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
                         |context, (region, output_path, overlaps_gc)| {
                             let tools = ExternalTools::from_args(args);
-                            if *overlaps_gc {
-                                run_one_with_htslib_context(
-                                    args,
-                                    &tools,
-                                    context,
-                                    std::slice::from_ref(region),
-                                    output_path,
-                                    gc_intervals.as_ref(),
-                                )
-                            } else {
-                                write_header_only_output(output_path, &tools)
-                            }
+                            run_parallel_region_output_with_htslib_context(
+                                args,
+                                &tools,
+                                context,
+                                region,
+                                output_path,
+                                *overlaps_gc,
+                                gc_intervals.as_ref(),
+                            )
                         },
                     )
                 })?;
@@ -198,17 +195,14 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
             pool.install(|| {
                 work.par_iter().try_for_each(|(region, output_path, overlaps_gc)| {
                     let tools = ExternalTools::from_args(args);
-                    if *overlaps_gc {
-                        run_one(
-                            args,
-                            &tools,
-                            std::slice::from_ref(region),
-                            output_path,
-                            gc_intervals.as_ref(),
-                        )
-                    } else {
-                        write_header_only_output(output_path, &tools)
-                    }
+                    run_parallel_region_output(
+                        args,
+                        &tools,
+                        region,
+                        output_path,
+                        *overlaps_gc,
+                        gc_intervals.as_ref(),
+                    )
                 })
             })?;
         }
@@ -259,24 +253,17 @@ fn run_parallel_single_output(
 
     let channel_capacity = (args.nproc * PARALLEL_CHUNK_CHANNEL_FACTOR).max(4);
     let (chunk_sender, chunk_receiver) = bounded::<ParallelChunkMessage>(channel_capacity);
-    let (recycle_sender, recycle_receiver) = bounded::<Vec<u8>>(channel_capacity);
-    for _ in 0..channel_capacity {
-        let _ = recycle_sender.send(Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY));
-    }
 
     let writer_tools = ExternalTools::from_args(args);
     let writer_output = args.out.clone();
     let expected_chunks = work.len();
-    let compression_threads = args.nproc.max(1);
     let writer_started = Instant::now();
     let writer_handle = thread::spawn(move || {
         write_ordered_parallel_output(
             &writer_output,
             &writer_tools,
             expected_chunks,
-            compression_threads,
             chunk_receiver,
-            recycle_sender,
         )
     });
 
@@ -291,24 +278,22 @@ fn run_parallel_single_output(
                             crate::htslib_mpileup::HtslibWorkerContext::from_args(args),
                             ExternalTools::from_args(args),
                             chunk_sender.clone(),
-                            recycle_receiver.clone(),
                         )
                     },
-                    |(context, tools, tx, recycled), (index, region)| -> Result<()> {
-                        let mut body = take_recycled_buffer(recycled);
+                    |(context, tools, tx), (index, region)| -> Result<()> {
                         let started = Instant::now();
-                        run_one_with_htslib_context_body_to_buffer(
+                        let chunk_tempfile = run_one_with_htslib_context_to_bgzip_tempfile(
                             args,
                             tools,
                             context,
                             region,
                             gc_intervals.as_ref(),
-                            &mut body,
+                            *index == 0,
                         )?;
                         let chunk = RegionChunkBuffer {
                             index: *index,
                             region: region.clone(),
-                            body,
+                            tempfile: chunk_tempfile,
                             elapsed: started.elapsed(),
                         };
                         tx.send(ParallelChunkMessage::Ready(chunk)).map_err(|err| {
@@ -340,17 +325,21 @@ fn run_parallel_single_output(
                     (
                         ExternalTools::from_args(args),
                         chunk_sender.clone(),
-                        recycle_receiver.clone(),
                     )
                 },
-                |(tools, tx, recycled), (index, region)| -> Result<()> {
-                    let mut body = take_recycled_buffer(recycled);
+                |(tools, tx), (index, region)| -> Result<()> {
                     let started = Instant::now();
-                    run_one_region_body_to_buffer(args, tools, region, gc_intervals.as_ref(), &mut body)?;
+                    let chunk_tempfile = run_one_region_to_bgzip_tempfile(
+                        args,
+                        tools,
+                        region,
+                        gc_intervals.as_ref(),
+                        *index == 0,
+                    )?;
                     let chunk = RegionChunkBuffer {
                         index: *index,
                         region: region.clone(),
-                        body,
+                        tempfile: chunk_tempfile,
                         elapsed: started.elapsed(),
                     };
                     tx.send(ParallelChunkMessage::Ready(chunk)).map_err(|err| {
@@ -395,97 +384,264 @@ fn run_parallel_single_output(
     Ok(())
 }
 
-fn take_recycled_buffer(recycle_receiver: &Receiver<Vec<u8>>) -> Vec<u8> {
-    match recycle_receiver.try_recv() {
-        Ok(mut buffer) => {
-            buffer.clear();
-            buffer
-        }
-        Err(TryRecvError::Empty) => {
-            debug!(
-                "recycle buffer pool empty; allocating a fresh chunk buffer to avoid worker stall"
-            );
-            Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY)
-        }
-        Err(TryRecvError::Disconnected) => {
-            debug!("recycle buffer channel disconnected; allocating a fresh chunk buffer");
-            Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY)
-        }
-    }
-}
-
 fn write_ordered_parallel_output(
     output: &str,
     tools: &ExternalTools,
     expected_chunks: usize,
-    compression_threads: usize,
     chunk_receiver: Receiver<ParallelChunkMessage>,
-    recycle_sender: Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut next_expected = 0usize;
-    let mut pending = HashMap::new();
-    let mut wait_cycles = 0u64;
+    let emit_compressed = output.ends_with(".gz");
 
-    writer::with_text_output_writer_with_threads(
-        output,
-        tools,
-        compression_threads,
-        |out| {
-        writer::write_seqz_header(out)?;
+    if output == "-" {
+        let mut out = stdout().lock();
+        write_ordered_parallel_chunks(
+            &mut out,
+            expected_chunks,
+            emit_compressed,
+            &chunk_receiver,
+        )?;
+        out.flush()?;
+    } else {
+        let mut out = BufWriter::new(File::create(output)?);
+        write_ordered_parallel_chunks(
+            &mut out,
+            expected_chunks,
+            emit_compressed,
+            &chunk_receiver,
+        )?;
+        out.flush()?;
+    }
 
-        while next_expected < expected_chunks {
-            let message = match chunk_receiver.recv_timeout(PARALLEL_CHUNK_RECV_TIMEOUT) {
-                Ok(message) => {
-                    wait_cycles = 0;
-                    message
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    wait_cycles += 1;
-                    warn!(
-                        next_expected,
-                        expected_chunks,
-                        pending_chunks = pending.len(),
-                        waited_seconds = wait_cycles * PARALLEL_CHUNK_RECV_TIMEOUT.as_secs(),
-                        "writer still waiting for next chunk"
-                    );
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(AppError::ParseError {
-                        message: format!(
-                            "parallel writer channel closed before all chunks were received (next={next_expected}, expected={expected_chunks})"
-                        ),
-                    });
-                }
-            };
-
-            let ParallelChunkMessage::Ready(chunk) = message;
-            let index = chunk.index;
-            let _ = pending.insert(index, chunk);
-
-            while let Some(mut ordered_chunk) = pending.remove(&next_expected) {
-                info!(
-                    index = ordered_chunk.index,
-                    region = %ordered_chunk.region,
-                    chunk_bytes = ordered_chunk.body.len(),
-                    worker_elapsed_ms = ordered_chunk.elapsed.as_millis(),
-                    "merging ordered region chunk"
-                );
-                out.write_all(&ordered_chunk.body)?;
-                ordered_chunk.body.clear();
-                let _ = recycle_sender.try_send(ordered_chunk.body);
-                next_expected += 1;
-            }
-        }
-        Ok(())
-    })?;
-
-    if output.ends_with(".gz") {
+    if emit_compressed {
         info!(output = %output, "indexing compressed seqz with tabix");
         tools.tabix_index_seqz(output)?;
     }
 
     Ok(())
+}
+
+fn write_ordered_parallel_chunks(
+    out: &mut dyn Write,
+    expected_chunks: usize,
+    emit_compressed: bool,
+    chunk_receiver: &Receiver<ParallelChunkMessage>,
+) -> Result<()> {
+    let mut next_expected = 0usize;
+    let mut pending = HashMap::new();
+    let mut wait_cycles = 0u64;
+
+    while next_expected < expected_chunks {
+        let message = match chunk_receiver.recv_timeout(PARALLEL_CHUNK_RECV_TIMEOUT) {
+            Ok(message) => {
+                wait_cycles = 0;
+                message
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                wait_cycles += 1;
+                warn!(
+                    next_expected,
+                    expected_chunks,
+                    pending_chunks = pending.len(),
+                    waited_seconds = wait_cycles * PARALLEL_CHUNK_RECV_TIMEOUT.as_secs(),
+                    "writer still waiting for next chunk"
+                );
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(AppError::ParseError {
+                    message: format!(
+                        "parallel writer channel closed before all chunks were received (next={next_expected}, expected={expected_chunks})"
+                    ),
+                });
+            }
+        };
+
+        let ParallelChunkMessage::Ready(chunk) = message;
+        let index = chunk.index;
+        let _ = pending.insert(index, chunk);
+
+        while let Some(ordered_chunk) = pending.remove(&next_expected) {
+            let chunk_bytes = ordered_chunk.tempfile.as_file().metadata()?.len();
+            info!(
+                index = ordered_chunk.index,
+                region = %ordered_chunk.region,
+                chunk_bytes,
+                worker_elapsed_ms = ordered_chunk.elapsed.as_millis(),
+                "merging ordered region chunk"
+            );
+
+            if emit_compressed {
+                append_file_to_writer(ordered_chunk.tempfile.path(), out)?;
+            } else {
+                append_bgzip_as_text_to_writer(ordered_chunk.tempfile.path(), out)?;
+            }
+            next_expected += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn append_file_to_writer(path: &std::path::Path, out: &mut dyn Write) -> Result<()> {
+    let mut input = File::open(path)?;
+    std::io::copy(&mut input, out)?;
+    Ok(())
+}
+
+fn append_bgzip_as_text_to_writer(path: &std::path::Path, out: &mut dyn Write) -> Result<()> {
+    let input = File::open(path)?;
+    let mut decoder = GzDecoder::new(input);
+    std::io::copy(&mut decoder, out)?;
+    Ok(())
+}
+
+fn run_parallel_region_output(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    region: &str,
+    output: &str,
+    overlaps_gc: bool,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+) -> Result<()> {
+    info!(
+        output = %output,
+        regions = %region,
+        pileup_mode = args.pileup,
+        "starting region pipeline"
+    );
+
+    let chunk_tempfile = if overlaps_gc {
+        run_one_region_to_bgzip_tempfile(args, tools, region, gc_intervals, true)?
+    } else {
+        write_bgzip_chunk_to_tempfile(tools, true, &[])?
+    };
+
+    finalize_region_chunk_output(chunk_tempfile, output, tools)?;
+    info!(output = %output, "completed region pipeline");
+    Ok(())
+}
+
+#[cfg(feature = "htslib-prototype")]
+fn run_parallel_region_output_with_htslib_context(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    context: &mut crate::htslib_mpileup::HtslibWorkerContext,
+    region: &str,
+    output: &str,
+    overlaps_gc: bool,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+) -> Result<()> {
+    info!(
+        output = %output,
+        regions = %region,
+        pileup_mode = args.pileup,
+        "starting region pipeline"
+    );
+
+    let chunk_tempfile = if overlaps_gc {
+        run_one_with_htslib_context_to_bgzip_tempfile(
+            args,
+            tools,
+            context,
+            region,
+            gc_intervals,
+            true,
+        )?
+    } else {
+        write_bgzip_chunk_to_tempfile(tools, true, &[])?
+    };
+
+    finalize_region_chunk_output(chunk_tempfile, output, tools)?;
+    info!(output = %output, "completed region pipeline");
+    Ok(())
+}
+
+fn run_one_region_to_bgzip_tempfile(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    region: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+    include_header: bool,
+) -> Result<NamedTempFile> {
+    let mut body = Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY);
+    run_one_region_body_to_buffer(args, tools, region, gc_intervals, &mut body)?;
+    write_bgzip_chunk_to_tempfile(tools, include_header, &body)
+}
+
+#[cfg(feature = "htslib-prototype")]
+fn run_one_with_htslib_context_to_bgzip_tempfile(
+    args: &Bam2SeqzArgs,
+    tools: &ExternalTools,
+    context: &mut crate::htslib_mpileup::HtslibWorkerContext,
+    region: &str,
+    gc_intervals: &HashMap<String, Vec<GcInterval>>,
+    include_header: bool,
+) -> Result<NamedTempFile> {
+    let mut body = Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY);
+    run_one_with_htslib_context_body_to_buffer(args, tools, context, region, gc_intervals, &mut body)?;
+    write_bgzip_chunk_to_tempfile(tools, include_header, &body)
+}
+
+fn write_bgzip_chunk_to_tempfile(
+    tools: &ExternalTools,
+    include_header: bool,
+    body: &[u8],
+) -> Result<NamedTempFile> {
+    let temp = Builder::new()
+        .prefix("bam2seqz_parallel_chunk_")
+        .suffix(".seqz.gz")
+        .tempfile_in("tmp")?;
+    let temp_path = temp.path().to_string_lossy().into_owned();
+
+    writer::with_text_output_writer(&temp_path, tools, |out| {
+        if include_header {
+            writer::write_seqz_header(out)?;
+        }
+        out.write_all(body)?;
+        Ok(())
+    })?;
+
+    Ok(temp)
+}
+
+fn finalize_region_chunk_output(
+    chunk_tempfile: NamedTempFile,
+    output: &str,
+    tools: &ExternalTools,
+) -> Result<()> {
+    if output.ends_with(".gz") {
+        persist_tempfile_to_path(chunk_tempfile, output)?;
+        info!(output = %output, "indexing compressed seqz with tabix");
+        tools.tabix_index_seqz(output)?;
+        return Ok(());
+    }
+
+    if output == "-" {
+        let mut out = stdout().lock();
+        append_bgzip_as_text_to_writer(chunk_tempfile.path(), &mut out)?;
+        out.flush()?;
+    } else {
+        let mut out = BufWriter::new(File::create(output)?);
+        append_bgzip_as_text_to_writer(chunk_tempfile.path(), &mut out)?;
+        out.flush()?;
+    }
+
+    Ok(())
+}
+
+fn persist_tempfile_to_path(chunk_tempfile: NamedTempFile, output: &str) -> Result<()> {
+    match chunk_tempfile.persist(output) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let file = error.file;
+            let mut input = File::open(file.path())?;
+            let mut out = BufWriter::new(File::create(output)?);
+            std::io::copy(&mut input, &mut out)?;
+            out.flush()?;
+            fs::remove_file(file.path())?;
+            Ok(())
+        }
+    }
 }
 
 fn run_one_region_body_to_buffer(
