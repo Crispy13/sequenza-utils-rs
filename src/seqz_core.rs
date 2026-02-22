@@ -383,7 +383,7 @@ fn parse_homoz(
         reference.to_string(),
         normal_depth.to_string(),
         tumor_depth.to_string(),
-        py_str_round3(tumor_depth as f64 / normal_depth as f64),
+        depth_ratio_str(normal_depth, tumor_depth, true),
         py_str_round3(tumor_freq[allele_idx]),
         "0".to_string(),
         "hom".to_string(),
@@ -412,7 +412,7 @@ fn parse_heteroz(
         reference.to_string(),
         normal_depth.to_string(),
         tumor_depth.to_string(),
-        format!("{:.3}", tumor_depth as f64 / normal_depth as f64),
+        depth_ratio_str(normal_depth, tumor_depth, false),
         py_str_round3(selected[0]),
         py_str_round3(selected[1]),
         "het".to_string(),
@@ -440,6 +440,46 @@ fn index_to_base(index: usize) -> char {
         1 => 'C',
         2 => 'G',
         _ => 'T',
+    }
+}
+
+fn depth_ratio_str(normal_depth: i32, tumor_depth: i32, strip_trailing: bool) -> String {
+    let n = normal_depth as i64;
+    let t = tumor_depth as i64;
+    if n == 0 {
+        return "0.000".to_string();
+    }
+
+    let (q, rem) = ((t * 1000) / n, (t * 1000) % n);
+    let rounded = if strip_trailing {
+        if rem > n / 2 {
+            q + 1
+        } else if rem < n / 2 {
+            q
+        } else if n % 2 == 0 {
+            if q % 2 == 0 {
+                q
+            } else {
+                q + 1
+            }
+        } else {
+            q
+        }
+    } else {
+        (t * 1000 + n / 2) / n
+    };
+
+    let int_part = rounded / 1000;
+    let frac = rounded % 1000;
+    let text = format!("{int_part}.{frac:03}");
+    if strip_trailing {
+        let mut trimmed = text.trim_end_matches('0').to_string();
+        if trimmed.ends_with('.') {
+            trimmed.push('0');
+        }
+        trimmed
+    } else {
+        text
     }
 }
 
