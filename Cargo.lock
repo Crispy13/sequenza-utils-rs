@@ -1493,7 +1493,7 @@ checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "sequenza-utils"
-version = "0.1.6"
+version = "0.1.9"
 dependencies = [
  "bio",
  "clap",
