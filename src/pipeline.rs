@@ -1,7 +1,7 @@
 use crate::cli::{Bam2SeqzArgs, BamBackend};
 use crate::errors::{AppError, Result};
 use crate::external_tools::{CommandStream, ExternalTools};
-use crate::seqz_core::{SeqzParams, do_seqz};
+use crate::seqz_core::{SeqzInput, SeqzParams, do_seqz_typed};
 use crate::writer;
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use flate2::read::GzDecoder;
@@ -12,9 +12,9 @@ use rayon::prelude::*;
 use rust_htslib::bam::Read as _;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdout};
+use std::path::Path;
 use std::process::Child;
 use std::sync::Arc;
 use std::thread;
@@ -86,6 +86,7 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
     );
     let plan = build_plan(args)?;
     let base_tools = ExternalTools::from_args(args);
+    validate_bam_fasta_chromosome_naming(args, &base_tools)?;
     let gc_intervals = Arc::new(load_gc_intervals_for_run(args, &base_tools)?);
 
     if args.nproc > 1 {
@@ -241,6 +242,11 @@ fn run_parallel_single_output(
         requested_threads = args.nproc,
         effective_parallelism,
         "starting parallel single-output run"
+    );
+    info!(
+        compression_backend = "external_bgzip_cli",
+        worker_chunk_compression = true,
+        "parallel chunk compression backend"
     );
     if effective_parallelism < args.nproc {
         info!(
@@ -703,9 +709,7 @@ fn run_one_region_body_to_buffer(
         het_only: false,
     };
 
-    let mut normal_line = String::with_capacity(96);
-    let mut tumor_line = String::with_capacity(96);
-    let mut alt_line = String::with_capacity(96);
+    let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
     while let Some(normal) = normal_stream.next_record()? {
         advance_to_target(&mut tumor_current, &mut tumor_stream, &normal)?;
@@ -716,36 +720,34 @@ fn run_one_region_body_to_buffer(
             continue;
         }
 
-        let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
+        let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position) else {
             continue;
         };
 
-        normal.write_data_line(&mut normal_line);
-        tumor.write_data_line(&mut tumor_line);
-
-        let seqz_fields = if let Some(stream) = alt_stream.as_mut() {
+        let normal2_depth_override = if let Some(stream) = alt_stream.as_mut() {
             advance_to_target(&mut alt_current, stream, &normal)?;
-            if let Some(alt) = alt_current.as_ref() {
-                if compare_coordinates(alt, &normal) == Ordering::Equal {
-                    alt.write_data_line(&mut alt_line);
-                    do_seqz(
-                        &[
-                            normal_line.as_str(),
-                            tumor_line.as_str(),
-                            gc,
-                            alt_line.as_str(),
-                        ],
-                        &params,
-                    )
-                } else {
-                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                }
-            } else {
-                do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-            }
+            alt_current
+                .as_ref()
+                .filter(|alt| compare_coordinates(alt, &normal) == Ordering::Equal)
+                .map(|alt| alt.depth)
         } else {
-            do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+            None
         };
+
+        let seqz_fields = do_seqz_typed(
+            &SeqzInput {
+                reference: &normal.reference,
+                normal_depth: normal.depth,
+                normal_pileup: &normal.pileup,
+                normal_quality: &normal.quality,
+                tumor_depth: tumor.depth,
+                tumor_pileup: &tumor.pileup,
+                tumor_quality: &tumor.quality,
+                gc,
+                normal2_depth_override,
+            },
+            &params,
+        );
 
         if let Some(seqz) = seqz_fields {
             let _ = write!(out, "{}\t{}", normal.chromosome, normal.position);
@@ -785,9 +787,7 @@ fn run_one_with_htslib_context_body_to_buffer(
         return Ok(());
     }
 
-    let mut normal_line = String::with_capacity(96);
-    let mut tumor_line = String::with_capacity(96);
-    let mut alt_line = String::with_capacity(96);
+    let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
     for region_spec_text in resolved_regions {
         let mut readers = context.readers_mut()?;
@@ -840,14 +840,11 @@ fn run_one_with_htslib_context_body_to_buffer(
                 continue;
             }
 
-            let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
+            let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position) else {
                 continue;
             };
 
-            normal.write_data_line(&mut normal_line);
-            tumor.write_data_line(&mut tumor_line);
-
-            let seqz_fields = if let Some(iter) = alt_iter.as_mut() {
+            let normal2_depth_override = if let Some(iter) = alt_iter.as_mut() {
                 while let Some(alt) = alt_current.as_ref() {
                     if compare_htslib_coordinates(alt, &normal) == Ordering::Less {
                         alt_current = crate::htslib_mpileup::next_record_from_pileups(
@@ -860,27 +857,28 @@ fn run_one_with_htslib_context_body_to_buffer(
                     break;
                 }
 
-                if let Some(alt) = alt_current.as_ref() {
-                    if compare_htslib_coordinates(alt, &normal) == Ordering::Equal {
-                        alt.write_data_line(&mut alt_line);
-                        do_seqz(
-                            &[
-                                normal_line.as_str(),
-                                tumor_line.as_str(),
-                                gc,
-                                alt_line.as_str(),
-                            ],
-                            &params,
-                        )
-                    } else {
-                        do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                    }
-                } else {
-                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                }
+                alt_current
+                    .as_ref()
+                    .filter(|alt| compare_htslib_coordinates(alt, &normal) == Ordering::Equal)
+                    .map(|alt| alt.depth)
             } else {
-                do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                None
             };
+
+            let seqz_fields = do_seqz_typed(
+                &SeqzInput {
+                    reference: &normal.reference,
+                    normal_depth: normal.depth,
+                    normal_pileup: &normal.pileup,
+                    normal_quality: &normal.quality,
+                    tumor_depth: tumor.depth,
+                    tumor_pileup: &tumor.pileup,
+                    tumor_quality: &tumor.quality,
+                    gc,
+                    normal2_depth_override,
+                },
+                &params,
+            );
 
             if let Some(seqz) = seqz_fields {
                 let _ = write!(out, "{}\t{}", normal.chromosome, normal.position);
@@ -932,7 +930,7 @@ fn estimate_gc_covered_bases(
 ) -> u64 {
     chromosomes
         .iter()
-        .filter_map(|chromosome| gc_intervals.get(chromosome))
+        .filter_map(|chromosome| find_gc_intervals_for_chromosome(gc_intervals, chromosome))
         .flat_map(|intervals| intervals.iter())
         .filter(|interval| interval.end > interval.start)
         .map(|interval| u64::try_from(interval.end - interval.start).unwrap_or(0))
@@ -971,7 +969,7 @@ fn auto_bin_regions_for_chromosomes(
 ) -> Vec<String> {
     let mut regions = Vec::new();
     for chromosome in chromosomes {
-        let Some(intervals) = gc_intervals.get(chromosome) else {
+        let Some(intervals) = find_gc_intervals_for_chromosome(gc_intervals, chromosome) else {
             continue;
         };
         let bins = gc_overlapping_bins(intervals, bin_size_bp);
@@ -1128,9 +1126,7 @@ fn run_one(
     writer::with_text_output_writer(output, tools, move |out| {
         writer::write_seqz_header(out)?;
 
-        let mut normal_line = String::with_capacity(96);
-        let mut tumor_line = String::with_capacity(96);
-        let mut alt_line = String::with_capacity(96);
+        let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
         while let Some(normal) = normal_stream.next_record()? {
             progress.on_processed(&normal.chromosome, normal.position);
@@ -1142,36 +1138,34 @@ fn run_one(
                 continue;
             }
 
-            let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position) else {
+            let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position) else {
                 continue;
             };
 
-            normal.write_data_line(&mut normal_line);
-            tumor.write_data_line(&mut tumor_line);
-
-            let seqz_fields = if let Some(stream) = alt_stream.as_mut() {
+            let normal2_depth_override = if let Some(stream) = alt_stream.as_mut() {
                 advance_to_target(&mut alt_current, stream, &normal)?;
-                if let Some(alt) = alt_current.as_ref() {
-                    if compare_coordinates(alt, &normal) == Ordering::Equal {
-                        alt.write_data_line(&mut alt_line);
-                        do_seqz(
-                            &[
-                                normal_line.as_str(),
-                                tumor_line.as_str(),
-                                gc,
-                                alt_line.as_str(),
-                            ],
-                            &params,
-                        )
-                    } else {
-                        do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                    }
-                } else {
-                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                }
+                alt_current
+                    .as_ref()
+                    .filter(|alt| compare_coordinates(alt, &normal) == Ordering::Equal)
+                    .map(|alt| alt.depth)
             } else {
-                do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                None
             };
+
+            let seqz_fields = do_seqz_typed(
+                &SeqzInput {
+                    reference: &normal.reference,
+                    normal_depth: normal.depth,
+                    normal_pileup: &normal.pileup,
+                    normal_quality: &normal.quality,
+                    tumor_depth: tumor.depth,
+                    tumor_pileup: &tumor.pileup,
+                    tumor_quality: &tumor.quality,
+                    gc,
+                    normal2_depth_override,
+                },
+                &params,
+            );
 
             if let Some(seqz) = seqz_fields {
                 progress.on_emitted();
@@ -1233,9 +1227,7 @@ fn run_one_with_htslib_context(
     writer::with_text_output_writer(output, tools, |out| {
         writer::write_seqz_header(out)?;
 
-        let mut normal_line = String::with_capacity(96);
-        let mut tumor_line = String::with_capacity(96);
-        let mut alt_line = String::with_capacity(96);
+        let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
         for region in resolved_regions {
             let mut readers = context.readers_mut()?;
@@ -1294,15 +1286,12 @@ fn run_one_with_htslib_context(
                     continue;
                 }
 
-                let Some(gc) = gc_value_at(gc_intervals, &normal.chromosome, normal.position)
+                let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position)
                 else {
                     continue;
                 };
 
-                normal.write_data_line(&mut normal_line);
-                tumor.write_data_line(&mut tumor_line);
-
-                let seqz_fields = if let Some(iter) = alt_iter.as_mut() {
+                let normal2_depth_override = if let Some(iter) = alt_iter.as_mut() {
                     while let Some(alt) = alt_current.as_ref() {
                         if compare_htslib_coordinates(alt, &normal) == Ordering::Less {
                             alt_current = crate::htslib_mpileup::next_record_from_pileups(
@@ -1315,27 +1304,28 @@ fn run_one_with_htslib_context(
                         break;
                     }
 
-                    if let Some(alt) = alt_current.as_ref() {
-                        if compare_htslib_coordinates(alt, &normal) == Ordering::Equal {
-                            alt.write_data_line(&mut alt_line);
-                            do_seqz(
-                                &[
-                                    normal_line.as_str(),
-                                    tumor_line.as_str(),
-                                    gc,
-                                    alt_line.as_str(),
-                                ],
-                                &params,
-                            )
-                        } else {
-                            do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                        }
-                    } else {
-                        do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
-                    }
+                    alt_current
+                        .as_ref()
+                        .filter(|alt| compare_htslib_coordinates(alt, &normal) == Ordering::Equal)
+                        .map(|alt| alt.depth)
                 } else {
-                    do_seqz(&[normal_line.as_str(), tumor_line.as_str(), gc], &params)
+                    None
                 };
+
+                let seqz_fields = do_seqz_typed(
+                    &SeqzInput {
+                        reference: &normal.reference,
+                        normal_depth: normal.depth,
+                        normal_pileup: &normal.pileup,
+                        normal_quality: &normal.quality,
+                        tumor_depth: tumor.depth,
+                        tumor_pileup: &tumor.pileup,
+                        tumor_quality: &tumor.quality,
+                        gc,
+                        normal2_depth_override,
+                    },
+                    &params,
+                );
 
                 if let Some(seqz) = seqz_fields {
                     progress.on_emitted();
@@ -1764,19 +1754,6 @@ struct PileupRecord {
     quality: String,
 }
 
-impl PileupRecord {
-    fn write_data_line(&self, buffer: &mut String) {
-        buffer.clear();
-        buffer.push_str(&self.reference);
-        buffer.push('\t');
-        let _ = write!(buffer, "{}", self.depth);
-        buffer.push('\t');
-        buffer.push_str(&self.pileup);
-        buffer.push('\t');
-        buffer.push_str(&self.quality);
-    }
-}
-
 fn parse_pileup_record(line: &[u8]) -> Result<PileupRecord> {
     let mut parts = line.splitn(6, |byte| *byte == b'\t');
     let chromosome_part = parts.next().ok_or_else(|| AppError::ParseError {
@@ -1938,6 +1915,75 @@ struct GcInterval {
     gc: String,
 }
 
+struct GcLookupCursor<'a> {
+    map: &'a HashMap<String, Vec<GcInterval>>,
+    chromosome: Option<String>,
+    intervals: Option<&'a [GcInterval]>,
+    index: usize,
+    last_position: Option<i32>,
+}
+
+impl<'a> GcLookupCursor<'a> {
+    fn new(map: &'a HashMap<String, Vec<GcInterval>>) -> Self {
+        Self {
+            map,
+            chromosome: None,
+            intervals: None,
+            index: 0,
+            last_position: None,
+        }
+    }
+
+    fn value_at(&mut self, chromosome: &str, position: i32) -> Option<&'a str> {
+        if self.chromosome.as_deref() != Some(chromosome) {
+            self.chromosome = Some(chromosome.to_string());
+            self.intervals = find_gc_intervals_for_chromosome(self.map, chromosome).map(Vec::as_slice);
+            self.index = 0;
+            self.last_position = None;
+        }
+
+        let intervals = self.intervals?;
+        if intervals.is_empty() {
+            return None;
+        }
+
+        if let Some(previous_position) = self.last_position {
+            if position < previous_position {
+                let idx = intervals.partition_point(|interval| interval.start <= position);
+                if idx == 0 {
+                    self.index = 0;
+                    self.last_position = Some(position);
+                    return None;
+                }
+                self.index = idx - 1;
+            } else {
+                while self.index < intervals.len() && position >= intervals[self.index].end {
+                    self.index += 1;
+                }
+            }
+        } else {
+            let idx = intervals.partition_point(|interval| interval.start <= position);
+            if idx == 0 {
+                self.last_position = Some(position);
+                return None;
+            }
+            self.index = idx - 1;
+        }
+
+        self.last_position = Some(position);
+
+        if self.index >= intervals.len() {
+            return None;
+        }
+
+        let interval = &intervals[self.index];
+        if position < interval.start {
+            return None;
+        }
+        (position < interval.end).then_some(interval.gc.as_str())
+    }
+}
+
 #[cfg(test)]
 fn parse_gc_intervals(lines: Vec<String>) -> HashMap<String, Vec<GcInterval>> {
     parse_gc_intervals_filtered(lines, None)
@@ -2013,17 +2059,35 @@ fn load_gc_intervals_for_run(
     args: &Bam2SeqzArgs,
     tools: &ExternalTools,
 ) -> Result<HashMap<String, Vec<GcInterval>>> {
-    let mut gc_filter: HashSet<String> = HashSet::new();
-    if !args.chr.is_empty() {
-        gc_filter.extend(args.chr.iter().map(|region| region_chromosome(region).to_string()));
+    let mut preferred_chromosomes: Vec<String> = if !args.chr.is_empty() {
+        let requested = args
+            .chr
+            .iter()
+            .map(|region| region_chromosome(region).to_string())
+            .collect::<Vec<_>>();
+        dedup_chromosomes_preserving_order(&requested)
     } else if !args.pileup {
-        gc_filter.extend(tools.list_bam_chromosomes(&args.tumor)?);
+        let mut chromosomes = tools.list_bam_chromosomes(&args.tumor)?;
         if let Some(normal2_path) = &args.normal2 {
-            gc_filter.extend(tools.list_bam_chromosomes(normal2_path)?);
+            chromosomes.extend(tools.list_bam_chromosomes(normal2_path)?);
         }
+        dedup_chromosomes_preserving_order(&chromosomes)
+    } else {
+        let mut pileup_paths = vec![args.normal.as_str(), args.tumor.as_str()];
+        if let Some(normal2_path) = args.normal2.as_deref() {
+            pileup_paths.push(normal2_path);
+        }
+        collect_pileup_chromosomes(&pileup_paths)?
+    };
+
+    preferred_chromosomes = dedup_chromosomes_preserving_order(&preferred_chromosomes);
+
+    let mut gc_filter: HashSet<String> = HashSet::new();
+    for chromosome in &preferred_chromosomes {
+        extend_chromosome_alias_filter(&mut gc_filter, chromosome);
     }
 
-    let gc_intervals = parse_gc_intervals_from_file(
+    let mut gc_intervals = parse_gc_intervals_from_file(
         &args.gc,
         if gc_filter.is_empty() {
             None
@@ -2031,6 +2095,12 @@ fn load_gc_intervals_for_run(
             Some(&gc_filter)
         },
     )?;
+    if !preferred_chromosomes.is_empty() {
+        gc_intervals = remap_gc_intervals_to_preferred_chromosomes(
+            gc_intervals,
+            &preferred_chromosomes,
+        );
+    }
     let gc_interval_count = gc_intervals.values().map(Vec::len).sum::<usize>();
     info!(
         chromosomes = gc_intervals.len(),
@@ -2038,6 +2108,59 @@ fn load_gc_intervals_for_run(
         "loaded gc intervals"
     );
     Ok(gc_intervals)
+}
+
+fn collect_pileup_chromosomes(paths: &[&str]) -> Result<Vec<String>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut ordered = Vec::new();
+
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+
+        if path.ends_with(".gz") {
+            let file = File::open(path)?;
+            let decoder = GzDecoder::new(file);
+            collect_pileup_chromosomes_from_reader(BufReader::new(decoder), &mut seen, &mut ordered)?;
+        } else {
+            let file = File::open(path)?;
+            collect_pileup_chromosomes_from_reader(BufReader::new(file), &mut seen, &mut ordered)?;
+        }
+    }
+
+    Ok(ordered)
+}
+
+fn collect_pileup_chromosomes_from_reader<R: BufRead>(
+    mut reader: R,
+    seen: &mut HashSet<String>,
+    ordered: &mut Vec<String>,
+) -> Result<()> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+
+        let line = trim_line_end(&buf);
+        if line.is_empty() {
+            continue;
+        }
+
+        let chromosome = line.split(|byte| *byte == b'\t').next().unwrap_or(line);
+        if chromosome.is_empty() {
+            continue;
+        }
+
+        let chromosome_name = decode_field(chromosome);
+        if seen.insert(chromosome_name.clone()) {
+            ordered.push(chromosome_name);
+        }
+    }
+    Ok(())
 }
 
 fn trim_line_end(line: &[u8]) -> &[u8] {
@@ -2082,9 +2205,43 @@ fn parse_gc_data_line(line: &[u8]) -> Option<(i32, String)> {
 }
 
 fn parse_i32_ascii(bytes: &[u8]) -> Option<i32> {
-    std::str::from_utf8(bytes)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut index = 0;
+    let mut is_negative = false;
+    match bytes[0] {
+        b'-' => {
+            is_negative = true;
+            index = 1;
+        }
+        b'+' => {
+            index = 1;
+        }
+        _ => {}
+    }
+
+    if index == bytes.len() {
+        return None;
+    }
+
+    let mut value: i32 = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let digit = i32::from(byte - b'0');
+        value = if is_negative {
+            value.checked_mul(10)?.checked_sub(digit)?
+        } else {
+            value.checked_mul(10)?.checked_add(digit)?
+        };
+        index += 1;
+    }
+
+    Some(value)
 }
 
 #[cfg(test)]
@@ -2158,7 +2315,7 @@ fn filter_regions_with_gc(
 
 fn region_overlaps_gc(gc_map: &HashMap<String, Vec<GcInterval>>, region: &str) -> bool {
     let chromosome = region_chromosome(region);
-    let Some(intervals) = gc_map.get(chromosome) else {
+    let Some(intervals) = find_gc_intervals_for_chromosome(gc_map, chromosome) else {
         return false;
     };
     if intervals.is_empty() {
@@ -2203,7 +2360,7 @@ fn create_gc_target_bed_for_regions(
     } else {
         for region in regions {
             let chromosome = region_chromosome(region);
-            let Some(intervals) = gc_map.get(chromosome) else {
+            let Some(intervals) = find_gc_intervals_for_chromosome(gc_map, chromosome) else {
                 continue;
             };
 
@@ -2297,18 +2454,227 @@ fn region_chromosome(region: &str) -> &str {
     region.split(':').next().unwrap_or(region)
 }
 
+#[cfg(test)]
 fn gc_value_at<'a>(
     map: &'a HashMap<String, Vec<GcInterval>>,
     chromosome: &str,
     position: i32,
 ) -> Option<&'a str> {
-    let intervals = map.get(chromosome)?;
+    let intervals = find_gc_intervals_for_chromosome(map, chromosome)?;
     let index = intervals.partition_point(|interval| interval.start <= position);
     if index == 0 {
         return None;
     }
     let interval = &intervals[index - 1];
     (position < interval.end).then_some(interval.gc.as_str())
+}
+
+fn validate_bam_fasta_chromosome_naming(args: &Bam2SeqzArgs, tools: &ExternalTools) -> Result<()> {
+    if args.pileup {
+        return Ok(());
+    }
+
+    let Some(fasta_path) = args.fasta.as_deref() else {
+        return Ok(());
+    };
+
+    let fasta_chromosomes = read_fasta_index_chromosomes(fasta_path)?;
+    if fasta_chromosomes.is_empty() {
+        return Ok(());
+    }
+
+    let bam_targets = if args.chr.is_empty() {
+        tools.list_bam_chromosomes(&args.tumor)?
+    } else {
+        let requested = args
+            .chr
+            .iter()
+            .map(|region| region_chromosome(region).to_string())
+            .collect::<Vec<_>>();
+        dedup_chromosomes_preserving_order(&requested)
+    };
+
+    let mut alias_only_mismatches = Vec::new();
+    for chromosome in bam_targets {
+        if fasta_chromosomes
+            .iter()
+            .any(|fasta_chromosome| fasta_chromosome == &chromosome)
+        {
+            continue;
+        }
+
+        if fasta_chromosomes
+            .iter()
+            .any(|fasta_chromosome| chromosome_alias_match(&chromosome, fasta_chromosome))
+        {
+            alias_only_mismatches.push(chromosome);
+        }
+    }
+
+    if alias_only_mismatches.is_empty() {
+        return Ok(());
+    }
+
+    let preview = alias_only_mismatches
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(AppError::InvalidValue {
+        flag: "--fasta".to_string(),
+        value: fasta_path.to_string(),
+        reason: format!(
+            "BAM and FASTA chromosome names are prefix-mismatched (e.g. {preview}). Use a FASTA/.fai with exactly matching contig names (chr-prefix differences are not safe to auto-rewrite for mpileup)."
+        ),
+    })
+}
+
+fn read_fasta_index_chromosomes(fasta_path: &str) -> Result<Vec<String>> {
+    let index_path = format!("{fasta_path}.fai");
+    if !Path::new(&index_path).exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(index_path)?;
+    let reader = BufReader::new(file);
+    let mut chromosomes = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let chromosome = line
+            .split('\t')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        if !chromosome.is_empty() && !chromosomes.iter().any(|entry| entry == chromosome) {
+            chromosomes.push(chromosome.to_string());
+        }
+    }
+    Ok(chromosomes)
+}
+
+fn remap_gc_intervals_to_preferred_chromosomes(
+    mut gc_intervals: HashMap<String, Vec<GcInterval>>,
+    preferred_chromosomes: &[String],
+) -> HashMap<String, Vec<GcInterval>> {
+    if preferred_chromosomes.is_empty() {
+        return gc_intervals;
+    }
+
+    let mut remapped: HashMap<String, Vec<GcInterval>> = HashMap::new();
+    for (chromosome, intervals) in gc_intervals.drain() {
+        let target = resolve_preferred_chromosome(&chromosome, preferred_chromosomes)
+            .unwrap_or(chromosome.as_str())
+            .to_string();
+        remapped.entry(target).or_default().extend(intervals);
+    }
+
+    for intervals in remapped.values_mut() {
+        intervals.sort_unstable_by(|left, right| {
+            left.start
+                .cmp(&right.start)
+                .then_with(|| left.end.cmp(&right.end))
+                .then_with(|| left.gc.cmp(&right.gc))
+        });
+        intervals.dedup_by(|left, right| {
+            left.start == right.start && left.end == right.end && left.gc == right.gc
+        });
+    }
+
+    remapped
+}
+
+fn extend_chromosome_alias_filter(filter: &mut HashSet<String>, chromosome: &str) {
+    for alias in chromosome_aliases(chromosome) {
+        let _ = filter.insert(alias);
+    }
+}
+
+fn resolve_preferred_chromosome<'a>(
+    chromosome: &str,
+    preferred_chromosomes: &'a [String],
+) -> Option<&'a str> {
+    preferred_chromosomes
+        .iter()
+        .find(|candidate| candidate.as_str() == chromosome)
+        .map(String::as_str)
+        .or_else(|| {
+            preferred_chromosomes
+                .iter()
+                .find(|candidate| chromosome_alias_match(candidate, chromosome))
+                .map(String::as_str)
+        })
+}
+
+fn find_gc_intervals_for_chromosome<'a>(
+    gc_map: &'a HashMap<String, Vec<GcInterval>>,
+    chromosome: &str,
+) -> Option<&'a Vec<GcInterval>> {
+    if let Some(intervals) = gc_map.get(chromosome) {
+        return Some(intervals);
+    }
+
+    for alias in chromosome_aliases(chromosome) {
+        if alias == chromosome {
+            continue;
+        }
+        if let Some(intervals) = gc_map.get(alias.as_str()) {
+            return Some(intervals);
+        }
+    }
+
+    gc_map
+        .iter()
+        .find(|(candidate, _)| chromosome_alias_match(candidate, chromosome))
+        .map(|(_, intervals)| intervals)
+}
+
+fn chromosome_alias_match(left: &str, right: &str) -> bool {
+    canonical_chromosome_name(left) == canonical_chromosome_name(right)
+}
+
+fn canonical_chromosome_name(raw: &str) -> String {
+    let normalized = strip_chr_prefix(raw.trim());
+    if normalized.eq_ignore_ascii_case("MT") {
+        "M".to_string()
+    } else {
+        normalized.to_ascii_uppercase()
+    }
+}
+
+fn chromosome_aliases(chromosome: &str) -> Vec<String> {
+    let raw = chromosome.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    let mut aliases: Vec<String> = Vec::with_capacity(6);
+    let mut push_unique = |candidate: String| {
+        if !aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+        {
+            aliases.push(candidate);
+        }
+    };
+
+    push_unique(raw.to_string());
+    let stripped = strip_chr_prefix(raw);
+    if !stripped.is_empty() {
+        push_unique(stripped.to_string());
+        push_unique(format!("chr{stripped}"));
+
+        if stripped.eq_ignore_ascii_case("M") {
+            push_unique("MT".to_string());
+            push_unique("chrMT".to_string());
+        } else if stripped.eq_ignore_ascii_case("MT") {
+            push_unique("M".to_string());
+            push_unique("chrM".to_string());
+        }
+    }
+
+    aliases
 }
 
 fn output_for_region(output: &str, region: &str) -> String {
@@ -2335,6 +2701,7 @@ fn split_ext_like_python(path: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use crate::cli::parse_args;
+    use std::collections::HashSet;
 
     #[test]
     fn build_plan_for_parallel_outputs() {
@@ -2440,6 +2807,59 @@ mod tests {
     }
 
     #[test]
+    fn gc_lookup_supports_chr_prefix_aliases() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+
+        assert_eq!(super::gc_value_at(&map, "20", 120), Some("48"));
+        assert_eq!(super::gc_value_at(&map, "chr20", 120), Some("48"));
+    }
+
+    #[test]
+    fn filter_regions_supports_chr_prefix_aliases() {
+        let lines = vec![
+            "variableStep chrom=20 span=50".to_string(),
+            "100\t48".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let regions = vec!["chr20:100-140".to_string(), "chr21:100-140".to_string()];
+
+        let filtered = super::filter_regions_with_gc(&regions, &map);
+        assert_eq!(filtered, vec!["chr20:100-140".to_string()]);
+    }
+
+    #[test]
+    fn auto_bins_support_chr_prefix_aliases() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let chromosomes = vec!["20".to_string()];
+
+        let bins = super::auto_bin_regions_for_chromosomes(&chromosomes, &map, 5_000_000);
+        assert_eq!(bins, vec!["20:1-5000000".to_string()]);
+    }
+
+    #[test]
+    fn remaps_gc_intervals_to_preferred_chromosome_style() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let preferred = vec!["20".to_string()];
+
+        let remapped = super::remap_gc_intervals_to_preferred_chromosomes(map, &preferred);
+        assert!(remapped.contains_key("20"));
+        assert!(!remapped.contains_key("chr20"));
+        assert_eq!(super::gc_value_at(&remapped, "20", 120), Some("48"));
+    }
+
+    #[test]
     fn auto_bins_gc_intervals_for_requested_chromosomes() {
         let lines = vec![
             "variableStep chrom=chr20 span=50".to_string(),
@@ -2516,5 +2936,72 @@ mod tests {
         let covered = 3_000_000_000_u64;
         let bin_size = super::choose_auto_bin_size_bp(covered, 64);
         assert_eq!(bin_size, super::AUTO_BIN_SIZE_BP);
+    }
+
+    #[test]
+    fn parse_i32_ascii_supports_signed_values_and_limits() {
+        assert_eq!(super::parse_i32_ascii(b"0"), Some(0));
+        assert_eq!(super::parse_i32_ascii(b"+42"), Some(42));
+        assert_eq!(super::parse_i32_ascii(b"-42"), Some(-42));
+        assert_eq!(super::parse_i32_ascii(i32::MAX.to_string().as_bytes()), Some(i32::MAX));
+        assert_eq!(super::parse_i32_ascii(i32::MIN.to_string().as_bytes()), Some(i32::MIN));
+    }
+
+    #[test]
+    fn parse_i32_ascii_rejects_invalid_or_overflow() {
+        assert_eq!(super::parse_i32_ascii(b""), None);
+        assert_eq!(super::parse_i32_ascii(b"-"), None);
+        assert_eq!(super::parse_i32_ascii(b"+"), None);
+        assert_eq!(super::parse_i32_ascii(b"12a"), None);
+        assert_eq!(super::parse_i32_ascii(b"2147483648"), None);
+        assert_eq!(super::parse_i32_ascii(b"-2147483649"), None);
+    }
+
+    #[test]
+    fn collect_pileup_chromosomes_from_reader_dedups_preserving_order() {
+        let data = b"chr20\t1\tA\t1\t.\tB\nchr20\t2\tA\t1\t.\tB\n21\t1\tC\t1\t.\tB\n";
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+
+        super::collect_pileup_chromosomes_from_reader(&data[..], &mut seen, &mut ordered)
+            .expect("expected parse success");
+
+        assert_eq!(ordered, vec!["chr20".to_string(), "21".to_string()]);
+    }
+
+    #[test]
+    fn gc_lookup_cursor_matches_gc_value_at() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+            "200\t49".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let mut cursor = super::GcLookupCursor::new(&map);
+
+        for position in [90, 100, 120, 149, 150, 199, 200, 220, 249, 260] {
+            assert_eq!(
+                cursor.value_at("chr20", position),
+                super::gc_value_at(&map, "chr20", position)
+            );
+        }
+    }
+
+    #[test]
+    fn gc_lookup_cursor_handles_chromosome_switches_and_backtracking() {
+        let lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+            "200\t49".to_string(),
+            "variableStep chrom=21 span=50".to_string(),
+            "100\t42".to_string(),
+        ];
+        let map = super::parse_gc_intervals(lines);
+        let mut cursor = super::GcLookupCursor::new(&map);
+
+        assert_eq!(cursor.value_at("chr20", 220), Some("49"));
+        assert_eq!(cursor.value_at("chr20", 120), Some("48"));
+        assert_eq!(cursor.value_at("21", 120), Some("42"));
+        assert_eq!(cursor.value_at("chr20", 120), Some("48"));
     }
 }

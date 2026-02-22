@@ -3,7 +3,6 @@ use crate::errors::{AppError, Result};
 use bio::io::fasta;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
-use std::fmt::Write as _;
 use std::fs::File;
 
 const MIN_MAPQ: u8 = 20;
@@ -17,19 +16,6 @@ pub(crate) struct HtslibPileupRecord {
     pub depth: i32,
     pub pileup: String,
     pub quality: String,
-}
-
-impl HtslibPileupRecord {
-    pub fn write_data_line(&self, buffer: &mut String) {
-        buffer.clear();
-        buffer.push_str(&self.reference);
-        buffer.push('\t');
-        let _ = write!(buffer, "{}", self.depth);
-        buffer.push('\t');
-        buffer.push_str(&self.pileup);
-        buffer.push('\t');
-        buffer.push_str(&self.quality);
-    }
 }
 
 #[derive(Debug, Clone)]

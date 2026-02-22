@@ -48,22 +48,44 @@ struct ACGTCounts {
     strand: [i32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqzInput<'a> {
+    pub reference: &'a str,
+    pub normal_depth: i32,
+    pub normal_pileup: &'a str,
+    pub normal_quality: &'a str,
+    pub tumor_depth: i32,
+    pub tumor_pileup: &'a str,
+    pub tumor_quality: &'a str,
+    pub gc: &'a str,
+    pub normal2_depth_override: Option<i32>,
+}
+
 pub fn do_seqz(data: &[&str], params: &SeqzParams) -> Option<Vec<String>> {
     let unpacked = unpack_data(data)?;
-    if unpacked.normal_depth + unpacked.tumor_depth < params.depth_sum {
+    do_seqz_typed(&unpacked, params)
+}
+
+pub fn do_seqz_typed(input: &SeqzInput<'_>, params: &SeqzParams) -> Option<Vec<String>> {
+    let reference = parse_reference_base(input.reference)?;
+    let normal_depth = input
+        .normal2_depth_override
+        .filter(|depth| *depth > 0)
+        .unwrap_or(input.normal_depth);
+    if normal_depth + input.tumor_depth < params.depth_sum {
         return None;
     }
 
     let normal = acgt(
-        &unpacked.normal_pileup,
-        &unpacked.normal_quality,
-        unpacked.reference,
+        input.normal_pileup,
+        input.normal_quality,
+        reference,
         params.qlimit,
     );
     let tumor = acgt(
-        &unpacked.tumor_pileup,
-        &unpacked.tumor_quality,
-        unpacked.reference,
+        input.tumor_pileup,
+        input.tumor_quality,
+        reference,
         params.qlimit,
     );
 
@@ -71,58 +93,49 @@ pub fn do_seqz(data: &[&str], params: &SeqzParams) -> Option<Vec<String>> {
         normal,
         tumor,
         params,
-        unpacked.normal_depth,
-        unpacked.tumor_depth,
-        unpacked.reference,
-        unpacked.gc,
+        normal_depth,
+        input.tumor_depth,
+        reference,
+        input.gc,
     )
 }
 
-#[derive(Debug, Clone)]
-struct UnpackedData {
-    reference: char,
-    normal_depth: i32,
-    normal_pileup: String,
-    normal_quality: String,
-    tumor_depth: i32,
-    tumor_pileup: String,
-    tumor_quality: String,
-    gc: String,
+fn parse_reference_base(reference: &str) -> Option<char> {
+    reference.chars().next().map(|base| base.to_ascii_uppercase())
 }
 
-fn unpack_data(data: &[&str]) -> Option<UnpackedData> {
+fn unpack_data<'a>(data: &'a [&'a str]) -> Option<SeqzInput<'a>> {
     if data.len() != 3 && data.len() != 4 {
         return None;
     }
 
     let normal_line = data[0];
     let tumor_line = data[1];
-    let gc = data[2].to_string();
+    let gc = data[2];
 
     let mut normal_parts = normal_line.split('\t');
-    let reference = normal_parts.next()?.chars().next()?.to_ascii_uppercase();
-    let mut normal_depth = normal_parts.next()?.parse::<i32>().ok()?;
-    let normal_pileup = normal_parts.next()?.to_string();
-    let normal_quality = normal_parts.next()?.to_string();
+    let reference = normal_parts.next()?;
+    let normal_depth = normal_parts.next()?.parse::<i32>().ok()?;
+    let normal_pileup = normal_parts.next()?;
+    let normal_quality = normal_parts.next()?;
 
     let mut tumor_parts = tumor_line.split('\t');
     let _tumor_ref = tumor_parts.next()?;
     let tumor_depth = tumor_parts.next()?.parse::<i32>().ok()?;
-    let tumor_pileup = tumor_parts.next()?.to_string();
-    let tumor_quality = tumor_parts.next()?.to_string();
+    let tumor_pileup = tumor_parts.next()?;
+    let tumor_quality = tumor_parts.next()?;
 
-    if data.len() == 4 {
-        let alt_depth = data[3]
+    let normal2_depth_override = if data.len() == 4 {
+        data[3]
             .split('\t')
             .nth(1)
             .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(0);
-        if alt_depth > 0 {
-            normal_depth = alt_depth;
-        }
-    }
+            .filter(|depth| *depth > 0)
+    } else {
+        None
+    };
 
-    Some(UnpackedData {
+    Some(SeqzInput {
         reference,
         normal_depth,
         normal_pileup,
@@ -131,6 +144,7 @@ fn unpack_data(data: &[&str]) -> Option<UnpackedData> {
         tumor_pileup,
         tumor_quality,
         gc,
+        normal2_depth_override,
     })
 }
 
@@ -229,7 +243,7 @@ fn acgt_to_seqz(
     normal_depth: i32,
     tumor_depth: i32,
     reference: char,
-    gc: String,
+    gc: &str,
 ) -> Option<Vec<String>> {
     let sum_normal: i32 = normal.counts.iter().sum();
     if sum_normal <= 0 {
@@ -261,7 +275,7 @@ fn acgt_to_seqz(
             tumor_depth,
             alleles[0],
             reference,
-            &gc,
+            gc,
         ))
     } else if alleles.len() == 2 {
         let mut sorted_alleles = alleles;
@@ -275,7 +289,7 @@ fn acgt_to_seqz(
             tumor_depth,
             sorted_alleles,
             reference,
-            &gc,
+            gc,
         ))
     } else {
         None
@@ -443,7 +457,51 @@ fn py_str_round3(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SeqzParams, do_seqz, py_str_round3, seqz_header};
+    use super::{SeqzInput, SeqzParams, do_seqz, do_seqz_typed, py_str_round3, seqz_header};
+
+    fn typed_input_from_lines<'a>(
+        normal_line: &'a str,
+        tumor_line: &'a str,
+        gc: &'a str,
+        normal2_line: Option<&'a str>,
+    ) -> SeqzInput<'a> {
+        let mut normal_parts = normal_line.split('\t');
+        let reference = normal_parts.next().expect("normal reference");
+        let normal_depth = normal_parts
+            .next()
+            .expect("normal depth")
+            .parse::<i32>()
+            .expect("valid normal depth");
+        let normal_pileup = normal_parts.next().expect("normal pileup");
+        let normal_quality = normal_parts.next().expect("normal quality");
+
+        let mut tumor_parts = tumor_line.split('\t');
+        let _ = tumor_parts.next().expect("tumor reference");
+        let tumor_depth = tumor_parts
+            .next()
+            .expect("tumor depth")
+            .parse::<i32>()
+            .expect("valid tumor depth");
+        let tumor_pileup = tumor_parts.next().expect("tumor pileup");
+        let tumor_quality = tumor_parts.next().expect("tumor quality");
+
+        let normal2_depth_override = normal2_line
+            .and_then(|line| line.split('\t').nth(1))
+            .and_then(|depth| depth.parse::<i32>().ok())
+            .filter(|depth| *depth > 0);
+
+        SeqzInput {
+            reference,
+            normal_depth,
+            normal_pileup,
+            normal_quality,
+            tumor_depth,
+            tumor_pileup,
+            tumor_quality,
+            gc,
+            normal2_depth_override,
+        }
+    }
 
     #[test]
     fn seqz_header_shape_matches_python() {
@@ -474,6 +532,34 @@ mod tests {
         assert_eq!(line_alt[9], "T");
         assert_eq!(line_alt[10], "C0.788");
         assert_eq!(line_alt[11], "C0.231");
+    }
+
+    #[test]
+    fn typed_api_matches_do_seqz_for_representative_cases() {
+        let params = SeqzParams::default();
+        let normal_het =
+            "T\t29\t,C.C,c,C,c,,,c,cCccC,c,,c,c,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
+        let normal_hom =
+            "T\t29\t,...,,,.,,,,,,,,.,,.,,,,,,,,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
+        let tumor = "T\t46\tc$ccc,cCcc.cc,cGcC.Ccc,c,C.CC,.CcC.ccc,Cc,ccccg\t/FFFFFgBF/FF/F/F<//FF/FFk</BF/<F/BF/FFB/FBFF</";
+
+        let cases = [
+            (normal_het, None),
+            (normal_hom, None),
+            (normal_hom, Some(tumor)),
+        ];
+
+        for (normal, normal2) in cases {
+            let mut data = vec![normal, tumor, "50"];
+            if let Some(alt) = normal2 {
+                data.push(alt);
+            }
+
+            let expected = do_seqz(&data, &params);
+            let typed = typed_input_from_lines(normal, tumor, "50", normal2);
+            let actual = do_seqz_typed(&typed, &params);
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
