@@ -101,7 +101,10 @@ pub fn do_seqz_typed(input: &SeqzInput<'_>, params: &SeqzParams) -> Option<Vec<S
 }
 
 fn parse_reference_base(reference: &str) -> Option<char> {
-    reference.chars().next().map(|base| base.to_ascii_uppercase())
+    reference
+        .chars()
+        .next()
+        .map(|base| base.to_ascii_uppercase())
 }
 
 fn unpack_data<'a>(data: &'a [&'a str]) -> Option<SeqzInput<'a>> {
@@ -537,10 +540,8 @@ mod tests {
     #[test]
     fn typed_api_matches_do_seqz_for_representative_cases() {
         let params = SeqzParams::default();
-        let normal_het =
-            "T\t29\t,C.C,c,C,c,,,c,cCccC,c,,c,c,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
-        let normal_hom =
-            "T\t29\t,...,,,.,,,,,,,,.,,.,,,,,,,,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
+        let normal_het = "T\t29\t,C.C,c,C,c,,,c,cCccC,c,,c,c,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
+        let normal_hom = "T\t29\t,...,,,.,,,,,,,,.,,.,,,,,,,,,\tBB/<FFFBFFFFFFBFFFF/7/7FBFFFF";
         let tumor = "T\t46\tc$ccc,cCcc.cc,cGcC.Ccc,c,C.CC,.CcC.ccc,Cc,ccccg\t/FFFFFgBF/FF/F/F<//FF/FFk</BF/<F/BF/FFB/FBFF</";
 
         let cases = [

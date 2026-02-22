@@ -173,9 +173,25 @@ fn long_running_parallel_p8_repeatability() {
     remove_outputs(output_b);
 
     let args_prefix = [
-        "-n", NORMAL_BAM, "-t", TUMOR_BAM, "-gc", GC_WIG, "-F", FASTA, "-C", REGIONS[0],
-        REGIONS[1], REGIONS[2], REGIONS[3], REGIONS[4], REGIONS[5], REGIONS[6], REGIONS[7],
-        "--parallel", "8",
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "-C",
+        REGIONS[0],
+        REGIONS[1],
+        REGIONS[2],
+        REGIONS[3],
+        REGIONS[4],
+        REGIONS[5],
+        REGIONS[6],
+        REGIONS[7],
+        "--parallel",
+        "8",
     ];
 
     let mut args_a = args_prefix.to_vec();

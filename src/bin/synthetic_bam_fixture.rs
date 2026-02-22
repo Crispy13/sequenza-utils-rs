@@ -1,7 +1,7 @@
-use sequenza_utils::errors::{AppError, Result};
 use clap::{ArgAction, Parser};
 #[cfg(feature = "mimalloc-allocator")]
 use mimalloc::MiMalloc;
+use sequenza_utils::errors::{AppError, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};

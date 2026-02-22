@@ -28,7 +28,11 @@ fn expected_header() -> String {
 }
 
 fn assert_header_only(path: &Path) {
-    assert!(path.is_file(), "expected output file to exist: {}", path.display());
+    assert!(
+        path.is_file(),
+        "expected output file to exist: {}",
+        path.display()
+    );
     let content = fs::read_to_string(path).expect("expected output content");
     assert_eq!(content, expected_header());
 }

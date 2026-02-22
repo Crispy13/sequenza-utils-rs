@@ -64,9 +64,12 @@ impl HtslibWorkerContext {
         }
 
         self.ensure_open()?;
-        let tumor_reader = self.tumor_reader.as_ref().ok_or_else(|| AppError::ParseError {
-            message: "missing tumor BAM reader in htslib worker context".to_string(),
-        })?;
+        let tumor_reader = self
+            .tumor_reader
+            .as_ref()
+            .ok_or_else(|| AppError::ParseError {
+                message: "missing tumor BAM reader in htslib worker context".to_string(),
+            })?;
 
         let header = tumor_reader.header();
         let mut regions = Vec::new();
@@ -78,9 +81,7 @@ impl HtslibWorkerContext {
         Ok(regions)
     }
 
-    pub fn readers_mut(
-        &mut self,
-    ) -> Result<HtslibReadersMut<'_>> {
+    pub fn readers_mut(&mut self) -> Result<HtslibReadersMut<'_>> {
         self.ensure_open()?;
         let normal = self
             .normal_reader
@@ -134,26 +135,28 @@ impl HtslibWorkerContext {
         }
 
         if self.fasta_reader.is_none() {
-            self.fasta_reader = Some(
-                fasta::IndexedReader::from_file(&self.fasta_path).map_err(|err| {
-                    AppError::ParseError {
-                        message: format!(
-                            "failed to open indexed FASTA reader for {}: {err}",
-                            self.fasta_path
-                        ),
-                    }
-                })?,
-            );
+            self.fasta_reader = Some(fasta::IndexedReader::from_file(&self.fasta_path).map_err(
+                |err| AppError::ParseError {
+                    message: format!(
+                        "failed to open indexed FASTA reader for {}: {err}",
+                        self.fasta_path
+                    ),
+                },
+            )?);
         }
 
         if self.normal2_reader.is_none()
             && let Some(path) = self.normal2_path.as_deref()
         {
-            self.normal2_reader = Some(bam::IndexedReader::from_path(path).map_err(|err| {
-                AppError::ParseError {
-                    message: format!("failed to open normal2 BAM index reader for {}: {err}", path),
-                }
-            })?);
+            self.normal2_reader =
+                Some(
+                    bam::IndexedReader::from_path(path).map_err(|err| AppError::ParseError {
+                        message: format!(
+                            "failed to open normal2 BAM index reader for {}: {err}",
+                            path
+                        ),
+                    })?,
+                );
         }
 
         Ok(())
@@ -166,12 +169,13 @@ pub(crate) fn parse_region_spec(reader: &bam::IndexedReader, region: &str) -> Re
             message: format!("invalid region bounds in {region}"),
         })?;
 
-        let start1 = start_raw
-            .replace(',', "")
-            .parse::<u64>()
-            .map_err(|_| AppError::ParseError {
-                message: format!("invalid region start in {region}"),
-            })?;
+        let start1 =
+            start_raw
+                .replace(',', "")
+                .parse::<u64>()
+                .map_err(|_| AppError::ParseError {
+                    message: format!("invalid region start in {region}"),
+                })?;
         let end1 = end_raw
             .replace(',', "")
             .parse::<u64>()
@@ -277,8 +281,7 @@ pub(crate) fn next_record_from_pileups(
             continue;
         }
 
-        let Some(reference_base) = reference_bases.get((position0 - spec.start0) as usize)
-        else {
+        let Some(reference_base) = reference_bases.get((position0 - spec.start0) as usize) else {
             continue;
         };
 
@@ -352,9 +355,11 @@ pub(crate) fn next_record_from_pileups(
 
 fn target_length(reader: &bam::IndexedReader, chrom: &str) -> Result<u64> {
     let header = reader.header();
-    let tid = header.tid(chrom.as_bytes()).ok_or_else(|| AppError::ParseError {
-        message: format!("chromosome not found in BAM header: {chrom}"),
-    })?;
+    let tid = header
+        .tid(chrom.as_bytes())
+        .ok_or_else(|| AppError::ParseError {
+            message: format!("chromosome not found in BAM header: {chrom}"),
+        })?;
 
     header.target_len(tid).ok_or_else(|| AppError::ParseError {
         message: format!("missing target length for chromosome: {chrom}"),

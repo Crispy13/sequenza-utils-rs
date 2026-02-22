@@ -1,6 +1,6 @@
-use std::process::ExitCode;
 #[cfg(feature = "mimalloc-allocator")]
 use mimalloc::MiMalloc;
+use std::process::ExitCode;
 
 #[cfg(feature = "mimalloc-allocator")]
 #[global_allocator]

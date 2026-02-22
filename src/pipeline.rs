@@ -58,6 +58,21 @@ struct AutoBinnedRegions {
     target_bins: usize,
 }
 
+#[derive(Debug)]
+struct SamtoolsWorkerContext {
+    tools: ExternalTools,
+    body: Vec<u8>,
+}
+
+impl SamtoolsWorkerContext {
+    fn from_args(args: &Bam2SeqzArgs) -> Self {
+        Self {
+            tools: ExternalTools::from_args(args),
+            body: Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY),
+        }
+    }
+}
+
 pub fn build_plan(args: &Bam2SeqzArgs) -> Result<PipelinePlan> {
     let output_paths = if args.nproc > 1 {
         args.chr
@@ -91,7 +106,8 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
 
     if args.nproc > 1 {
         if should_auto_bin_parallel(args) {
-            let auto_regions = derive_auto_binned_regions(args, &base_tools, gc_intervals.as_ref())?;
+            let auto_regions =
+                derive_auto_binned_regions(args, &base_tools, gc_intervals.as_ref())?;
             info!(
                 bins = auto_regions.regions.len(),
                 bin_size_bp = auto_regions.bin_size_bp,
@@ -144,7 +160,10 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let skipped_regions = work.iter().filter(|(_, _, overlaps_gc)| !*overlaps_gc).count();
+        let skipped_regions = work
+            .iter()
+            .filter(|(_, _, overlaps_gc)| !*overlaps_gc)
+            .count();
         if skipped_regions > 0 {
             info!(
                 requested = work.len(),
@@ -194,21 +213,29 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
             }
         } else {
             pool.install(|| {
-                work.par_iter().try_for_each(|(region, output_path, overlaps_gc)| {
-                    let tools = ExternalTools::from_args(args);
-                    run_parallel_region_output(
-                        args,
-                        &tools,
-                        region,
-                        output_path,
-                        *overlaps_gc,
-                        gc_intervals.as_ref(),
-                    )
-                })
+                work.par_iter().try_for_each_init(
+                    || SamtoolsWorkerContext::from_args(args),
+                    |context, (region, output_path, overlaps_gc)| {
+                        run_parallel_region_output(
+                            args,
+                            context,
+                            region,
+                            output_path,
+                            *overlaps_gc,
+                            gc_intervals.as_ref(),
+                        )
+                    },
+                )
             })?;
         }
     } else {
-        run_one(args, &base_tools, &args.chr, &args.out, gc_intervals.as_ref())?;
+        run_one(
+            args,
+            &base_tools,
+            &args.chr,
+            &args.out,
+            gc_intervals.as_ref(),
+        )?;
     }
 
     Ok(())
@@ -327,17 +354,12 @@ fn run_parallel_single_output(
     } else {
         pool.install(|| {
             work.par_iter().try_for_each_init(
-                || {
-                    (
-                        ExternalTools::from_args(args),
-                        chunk_sender.clone(),
-                    )
-                },
-                |(tools, tx), (index, region)| -> Result<()> {
+                || (SamtoolsWorkerContext::from_args(args), chunk_sender.clone()),
+                |(context, tx), (index, region)| -> Result<()> {
                     let started = Instant::now();
-                    let chunk_tempfile = run_one_region_to_bgzip_tempfile(
+                    let chunk_tempfile = run_one_region_to_bgzip_tempfile_with_context(
                         args,
-                        tools,
+                        context,
                         region,
                         gc_intervals.as_ref(),
                         *index == 0,
@@ -400,21 +422,11 @@ fn write_ordered_parallel_output(
 
     if output == "-" {
         let mut out = stdout().lock();
-        write_ordered_parallel_chunks(
-            &mut out,
-            expected_chunks,
-            emit_compressed,
-            &chunk_receiver,
-        )?;
+        write_ordered_parallel_chunks(&mut out, expected_chunks, emit_compressed, &chunk_receiver)?;
         out.flush()?;
     } else {
         let mut out = BufWriter::new(File::create(output)?);
-        write_ordered_parallel_chunks(
-            &mut out,
-            expected_chunks,
-            emit_compressed,
-            &chunk_receiver,
-        )?;
+        write_ordered_parallel_chunks(&mut out, expected_chunks, emit_compressed, &chunk_receiver)?;
         out.flush()?;
     }
 
@@ -503,7 +515,7 @@ fn append_bgzip_as_text_to_writer(path: &std::path::Path, out: &mut dyn Write) -
 
 fn run_parallel_region_output(
     args: &Bam2SeqzArgs,
-    tools: &ExternalTools,
+    context: &mut SamtoolsWorkerContext,
     region: &str,
     output: &str,
     overlaps_gc: bool,
@@ -517,12 +529,12 @@ fn run_parallel_region_output(
     );
 
     let chunk_tempfile = if overlaps_gc {
-        run_one_region_to_bgzip_tempfile(args, tools, region, gc_intervals, true)?
+        run_one_region_to_bgzip_tempfile_with_context(args, context, region, gc_intervals, true)?
     } else {
-        write_bgzip_chunk_to_tempfile(tools, true, &[])?
+        write_bgzip_chunk_to_tempfile(&context.tools, true, &[])?
     };
 
-    finalize_region_chunk_output(chunk_tempfile, output, tools)?;
+    finalize_region_chunk_output(chunk_tempfile, output, &context.tools)?;
     info!(output = %output, "completed region pipeline");
     Ok(())
 }
@@ -562,16 +574,22 @@ fn run_parallel_region_output_with_htslib_context(
     Ok(())
 }
 
-fn run_one_region_to_bgzip_tempfile(
+fn run_one_region_to_bgzip_tempfile_with_context(
     args: &Bam2SeqzArgs,
-    tools: &ExternalTools,
+    context: &mut SamtoolsWorkerContext,
     region: &str,
     gc_intervals: &HashMap<String, Vec<GcInterval>>,
     include_header: bool,
 ) -> Result<NamedTempFile> {
-    let mut body = Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY);
-    run_one_region_body_to_buffer(args, tools, region, gc_intervals, &mut body)?;
-    write_bgzip_chunk_to_tempfile(tools, include_header, &body)
+    context.body.clear();
+    run_one_region_body_to_buffer(
+        args,
+        &context.tools,
+        region,
+        gc_intervals,
+        &mut context.body,
+    )?;
+    write_bgzip_chunk_to_tempfile(&context.tools, include_header, &context.body)
 }
 
 #[cfg(feature = "htslib-prototype")]
@@ -584,7 +602,14 @@ fn run_one_with_htslib_context_to_bgzip_tempfile(
     include_header: bool,
 ) -> Result<NamedTempFile> {
     let mut body = Vec::with_capacity(PARALLEL_CHUNK_INITIAL_CAPACITY);
-    run_one_with_htslib_context_body_to_buffer(args, tools, context, region, gc_intervals, &mut body)?;
+    run_one_with_htslib_context_body_to_buffer(
+        args,
+        tools,
+        context,
+        region,
+        gc_intervals,
+        &mut body,
+    )?;
     write_bgzip_chunk_to_tempfile(tools, include_header, &body)
 }
 
@@ -693,11 +718,14 @@ fn run_one_region_body_to_buffer(
         &region_scope,
         gc_target_path.as_deref(),
     )?;
-    let mut tumor_current = tumor_stream.next_record()?;
-    let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
-        stream.next_record()?
+    let mut normal = PileupRecord::default();
+    let mut tumor_current = PileupRecord::default();
+    let mut tumor_present = tumor_stream.next_record_into(&mut tumor_current)?;
+    let mut alt_current = PileupRecord::default();
+    let mut alt_present = if let Some(stream) = alt_stream.as_mut() {
+        stream.next_record_into(&mut alt_current)?
     } else {
-        None
+        false
     };
 
     let params = SeqzParams {
@@ -711,12 +739,17 @@ fn run_one_region_body_to_buffer(
 
     let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
-    while let Some(normal) = normal_stream.next_record()? {
-        advance_to_target(&mut tumor_current, &mut tumor_stream, &normal)?;
-        let Some(tumor) = tumor_current.as_ref() else {
+    while normal_stream.next_record_into(&mut normal)? {
+        advance_to_target(
+            &mut tumor_present,
+            &mut tumor_current,
+            &mut tumor_stream,
+            &normal,
+        )?;
+        if !tumor_present {
             break;
-        };
-        if compare_coordinates(tumor, &normal) != Ordering::Equal {
+        }
+        if compare_coordinates(&tumor_current, &normal) != Ordering::Equal {
             continue;
         }
 
@@ -725,11 +758,12 @@ fn run_one_region_body_to_buffer(
         };
 
         let normal2_depth_override = if let Some(stream) = alt_stream.as_mut() {
-            advance_to_target(&mut alt_current, stream, &normal)?;
-            alt_current
-                .as_ref()
-                .filter(|alt| compare_coordinates(alt, &normal) == Ordering::Equal)
-                .map(|alt| alt.depth)
+            advance_to_target(&mut alt_present, &mut alt_current, stream, &normal)?;
+            if alt_present && compare_coordinates(&alt_current, &normal) == Ordering::Equal {
+                Some(alt_current.depth)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -740,9 +774,9 @@ fn run_one_region_body_to_buffer(
                 normal_depth: normal.depth,
                 normal_pileup: &normal.pileup,
                 normal_quality: &normal.quality,
-                tumor_depth: tumor.depth,
-                tumor_pileup: &tumor.pileup,
-                tumor_quality: &tumor.quality,
+                tumor_depth: tumor_current.depth,
+                tumor_pileup: &tumor_current.pileup,
+                tumor_quality: &tumor_current.quality,
                 gc,
                 normal2_depth_override,
             },
@@ -791,7 +825,8 @@ fn run_one_with_htslib_context_body_to_buffer(
 
     for region_spec_text in resolved_regions {
         let mut readers = context.readers_mut()?;
-        let region_spec = crate::htslib_mpileup::parse_region_spec(readers.tumor, &region_spec_text)?;
+        let region_spec =
+            crate::htslib_mpileup::parse_region_spec(readers.tumor, &region_spec_text)?;
         let reference_bases =
             crate::htslib_mpileup::fetch_reference_bases(readers.fasta, &region_spec)?;
 
@@ -1105,11 +1140,14 @@ fn run_one(
         region_scope,
         gc_target_path.as_deref(),
     )?;
-    let mut tumor_current = tumor_stream.next_record()?;
-    let mut alt_current = if let Some(stream) = alt_stream.as_mut() {
-        stream.next_record()?
+    let mut normal = PileupRecord::default();
+    let mut tumor_current = PileupRecord::default();
+    let mut tumor_present = tumor_stream.next_record_into(&mut tumor_current)?;
+    let mut alt_current = PileupRecord::default();
+    let mut alt_present = if let Some(stream) = alt_stream.as_mut() {
+        stream.next_record_into(&mut alt_current)?
     } else {
-        None
+        false
     };
 
     let params = SeqzParams {
@@ -1128,13 +1166,18 @@ fn run_one(
 
         let mut gc_cursor = GcLookupCursor::new(gc_intervals);
 
-        while let Some(normal) = normal_stream.next_record()? {
+        while normal_stream.next_record_into(&mut normal)? {
             progress.on_processed(&normal.chromosome, normal.position);
-            advance_to_target(&mut tumor_current, &mut tumor_stream, &normal)?;
-            let Some(tumor) = tumor_current.as_ref() else {
+            advance_to_target(
+                &mut tumor_present,
+                &mut tumor_current,
+                &mut tumor_stream,
+                &normal,
+            )?;
+            if !tumor_present {
                 break;
-            };
-            if compare_coordinates(tumor, &normal) != Ordering::Equal {
+            }
+            if compare_coordinates(&tumor_current, &normal) != Ordering::Equal {
                 continue;
             }
 
@@ -1143,11 +1186,12 @@ fn run_one(
             };
 
             let normal2_depth_override = if let Some(stream) = alt_stream.as_mut() {
-                advance_to_target(&mut alt_current, stream, &normal)?;
-                alt_current
-                    .as_ref()
-                    .filter(|alt| compare_coordinates(alt, &normal) == Ordering::Equal)
-                    .map(|alt| alt.depth)
+                advance_to_target(&mut alt_present, &mut alt_current, stream, &normal)?;
+                if alt_present && compare_coordinates(&alt_current, &normal) == Ordering::Equal {
+                    Some(alt_current.depth)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1158,9 +1202,9 @@ fn run_one(
                     normal_depth: normal.depth,
                     normal_pileup: &normal.pileup,
                     normal_quality: &normal.quality,
-                    tumor_depth: tumor.depth,
-                    tumor_pileup: &tumor.pileup,
-                    tumor_quality: &tumor.quality,
+                    tumor_depth: tumor_current.depth,
+                    tumor_pileup: &tumor_current.pileup,
+                    tumor_quality: &tumor_current.quality,
                     gc,
                     normal2_depth_override,
                 },
@@ -1286,8 +1330,7 @@ fn run_one_with_htslib_context(
                     continue;
                 }
 
-                let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position)
-                else {
+                let Some(gc) = gc_cursor.value_at(&normal.chromosome, normal.position) else {
                     continue;
                 };
 
@@ -1516,21 +1559,19 @@ struct PileupStream {
     region_source: Option<RegionStreamSource>,
 }
 
-#[derive(Debug)]
-struct StreamProcess {
-    child: Child,
-    stderr_capture: NamedTempFile,
-    command: String,
-    finished: bool,
-}
-
-#[derive(Debug, Clone)]
 struct RegionStreamSource {
     tools: ExternalTools,
     bam: String,
     fasta: String,
     target_bed: Option<String>,
     pending_regions: VecDeque<String>,
+}
+
+struct StreamProcess {
+    child: Child,
+    stderr_capture: NamedTempFile,
+    command: String,
+    finished: bool,
 }
 
 impl RegionStreamSource {
@@ -1697,7 +1738,7 @@ impl PileupStream {
         Ok(())
     }
 
-    fn next_record(&mut self) -> Result<Option<PileupRecord>> {
+    fn next_record_into(&mut self, record: &mut PileupRecord) -> Result<bool> {
         loop {
             self.line_buffer.clear();
             let read = self.reader.read_until(b'\n', &mut self.line_buffer)?;
@@ -1706,13 +1747,14 @@ impl PileupStream {
                 if self.advance_region_stream()? {
                     continue;
                 }
-                return Ok(None);
+                return Ok(false);
             }
             let line = trim_line_end(&self.line_buffer);
             if line.is_empty() || line.iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
-            return parse_pileup_record(line).map(Some);
+            parse_pileup_record_into(line, record)?;
+            return Ok(true);
         }
     }
 }
@@ -1742,7 +1784,7 @@ impl Drop for PileupStream {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct PileupRecord {
     chromosome: String,
     chromosome_group: u8,
@@ -1754,7 +1796,7 @@ struct PileupRecord {
     quality: String,
 }
 
-fn parse_pileup_record(line: &[u8]) -> Result<PileupRecord> {
+fn parse_pileup_record_into(line: &[u8], record: &mut PileupRecord) -> Result<()> {
     let mut parts = line.splitn(6, |byte| *byte == b'\t');
     let chromosome_part = parts.next().ok_or_else(|| AppError::ParseError {
         message: format!("invalid pileup line: {}", String::from_utf8_lossy(line)),
@@ -1782,27 +1824,35 @@ fn parse_pileup_record(line: &[u8]) -> Result<PileupRecord> {
         ),
     })?;
     let depth = parse_i32_ascii(depth_part).ok_or_else(|| AppError::ParseError {
-        message: format!("invalid pileup depth: {}", String::from_utf8_lossy(depth_part)),
+        message: format!(
+            "invalid pileup depth: {}",
+            String::from_utf8_lossy(depth_part)
+        ),
     })?;
-    let chromosome = decode_field(chromosome_part);
-    let (chromosome_group, chromosome_rank) = chromosome_sort_class(&chromosome);
-
-    Ok(PileupRecord {
-        chromosome,
-        chromosome_group,
-        chromosome_rank,
-        position,
-        reference: decode_field(reference_part),
-        depth,
-        pileup: decode_field(pileup_part),
-        quality: decode_field(quality_part),
-    })
+    decode_field_into(chromosome_part, &mut record.chromosome);
+    let (chromosome_group, chromosome_rank) = chromosome_sort_class(&record.chromosome);
+    record.chromosome_group = chromosome_group;
+    record.chromosome_rank = chromosome_rank;
+    record.position = position;
+    decode_field_into(reference_part, &mut record.reference);
+    record.depth = depth;
+    decode_field_into(pileup_part, &mut record.pileup);
+    decode_field_into(quality_part, &mut record.quality);
+    Ok(())
 }
 
 fn decode_field(field: &[u8]) -> String {
     match std::str::from_utf8(field) {
         Ok(text) => text.to_owned(),
         Err(_) => String::from_utf8_lossy(field).into_owned(),
+    }
+}
+
+fn decode_field_into(field: &[u8], target: &mut String) {
+    target.clear();
+    match std::str::from_utf8(field) {
+        Ok(text) => target.push_str(text),
+        Err(_) => target.push_str(&String::from_utf8_lossy(field)),
     }
 }
 
@@ -1892,20 +1942,15 @@ fn parse_u32_ascii_fast(raw: &[u8]) -> Option<u32> {
 }
 
 fn advance_to_target(
-    current: &mut Option<PileupRecord>,
+    current_present: &mut bool,
+    current: &mut PileupRecord,
     stream: &mut PileupStream,
     target: &PileupRecord,
 ) -> Result<()> {
-    loop {
-        let Some(record) = current.as_ref() else {
-            return Ok(());
-        };
-        if compare_coordinates(record, target) == Ordering::Less {
-            *current = stream.next_record()?;
-            continue;
-        }
-        return Ok(());
+    while *current_present && compare_coordinates(current, target) == Ordering::Less {
+        *current_present = stream.next_record_into(current)?;
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1937,7 +1982,8 @@ impl<'a> GcLookupCursor<'a> {
     fn value_at(&mut self, chromosome: &str, position: i32) -> Option<&'a str> {
         if self.chromosome.as_deref() != Some(chromosome) {
             self.chromosome = Some(chromosome.to_string());
-            self.intervals = find_gc_intervals_for_chromosome(self.map, chromosome).map(Vec::as_slice);
+            self.intervals =
+                find_gc_intervals_for_chromosome(self.map, chromosome).map(Vec::as_slice);
             self.index = 0;
             self.last_position = None;
         }
@@ -2096,10 +2142,8 @@ fn load_gc_intervals_for_run(
         },
     )?;
     if !preferred_chromosomes.is_empty() {
-        gc_intervals = remap_gc_intervals_to_preferred_chromosomes(
-            gc_intervals,
-            &preferred_chromosomes,
-        );
+        gc_intervals =
+            remap_gc_intervals_to_preferred_chromosomes(gc_intervals, &preferred_chromosomes);
     }
     let gc_interval_count = gc_intervals.values().map(Vec::len).sum::<usize>();
     info!(
@@ -2122,7 +2166,11 @@ fn collect_pileup_chromosomes(paths: &[&str]) -> Result<Vec<String>> {
         if path.ends_with(".gz") {
             let file = File::open(path)?;
             let decoder = GzDecoder::new(file);
-            collect_pileup_chromosomes_from_reader(BufReader::new(decoder), &mut seen, &mut ordered)?;
+            collect_pileup_chromosomes_from_reader(
+                BufReader::new(decoder),
+                &mut seen,
+                &mut ordered,
+            )?;
         } else {
             let file = File::open(path)?;
             collect_pileup_chromosomes_from_reader(BufReader::new(file), &mut seen, &mut ordered)?;
@@ -2367,7 +2415,8 @@ fn create_gc_target_bed_for_regions(
             let targets = by_chromosome.entry(chromosome.to_string()).or_default();
             if let Some((region_start, region_end_inclusive)) = parse_region_bounds(region) {
                 let region_end_exclusive = region_end_inclusive.saturating_add(1);
-                let start_index = intervals.partition_point(|interval| interval.end <= region_start);
+                let start_index =
+                    intervals.partition_point(|interval| interval.end <= region_start);
                 for interval in intervals[start_index..]
                     .iter()
                     .take_while(|interval| interval.start < region_end_exclusive)
@@ -2394,9 +2443,7 @@ fn create_gc_target_bed_for_regions(
             continue;
         }
         intervals.sort_unstable_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
         });
 
         let mut merged: Vec<(i32, i32)> = Vec::with_capacity(intervals.len());
@@ -2542,11 +2589,7 @@ fn read_fasta_index_chromosomes(fasta_path: &str) -> Result<Vec<String>> {
     let mut chromosomes = Vec::new();
     for line in reader.lines() {
         let line = line?;
-        let chromosome = line
-            .split('\t')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
+        let chromosome = line.split('\t').next().map(str::trim).unwrap_or_default();
         if !chromosome.is_empty() && !chromosomes.iter().any(|entry| entry == chromosome) {
             chromosomes.push(chromosome.to_string());
         }
@@ -2738,16 +2781,7 @@ mod tests {
     #[test]
     fn build_plan_sets_ascii_quality_threshold() {
         let args = parse_args([
-            "bam2seqz",
-            "-n",
-            "n.bam",
-            "-t",
-            "t.bam",
-            "-gc",
-            "gc.wig",
-            "-F",
-            "ref.fa",
-            "-f",
+            "bam2seqz", "-n", "n.bam", "-t", "t.bam", "-gc", "gc.wig", "-F", "ref.fa", "-f",
             "illumina",
         ])
         .expect("expected parse success");
@@ -2799,10 +2833,7 @@ mod tests {
         let filtered = super::filter_regions_with_gc(&regions, &map);
         assert_eq!(
             filtered,
-            vec![
-                "chr20:100-140".to_string(),
-                "chr20:bad-range".to_string(),
-            ]
+            vec!["chr20:100-140".to_string(), "chr20:bad-range".to_string(),]
         );
     }
 
@@ -2915,11 +2946,7 @@ mod tests {
         let deduped = super::dedup_chromosomes_preserving_order(&chromosomes);
         assert_eq!(
             deduped,
-            vec![
-                "chr20".to_string(),
-                "chr21".to_string(),
-                "chr1".to_string(),
-            ]
+            vec!["chr20".to_string(), "chr21".to_string(), "chr1".to_string(),]
         );
     }
 
@@ -2943,8 +2970,14 @@ mod tests {
         assert_eq!(super::parse_i32_ascii(b"0"), Some(0));
         assert_eq!(super::parse_i32_ascii(b"+42"), Some(42));
         assert_eq!(super::parse_i32_ascii(b"-42"), Some(-42));
-        assert_eq!(super::parse_i32_ascii(i32::MAX.to_string().as_bytes()), Some(i32::MAX));
-        assert_eq!(super::parse_i32_ascii(i32::MIN.to_string().as_bytes()), Some(i32::MIN));
+        assert_eq!(
+            super::parse_i32_ascii(i32::MAX.to_string().as_bytes()),
+            Some(i32::MAX)
+        );
+        assert_eq!(
+            super::parse_i32_ascii(i32::MIN.to_string().as_bytes()),
+            Some(i32::MIN)
+        );
     }
 
     #[test]

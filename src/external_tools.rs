@@ -268,10 +268,7 @@ impl ExternalTools {
         let command_label = if let Some(value) = region {
             command.arg("-r").arg(value).arg(bam);
             if let Some(path) = target_bed {
-                format!(
-                    "{} mpileup -l {} -r {} {}",
-                    self.samtools, path, value, bam
-                )
+                format!("{} mpileup -l {} -r {} {}", self.samtools, path, value, bam)
             } else {
                 format!("{} mpileup -r {} {}", self.samtools, value, bam)
             }
@@ -447,17 +444,7 @@ mod tests {
     #[test]
     fn builds_mpileup_command_with_regions() {
         let args = parse_args([
-            "bam2seqz",
-            "-n",
-            "n.bam",
-            "-t",
-            "t.bam",
-            "-gc",
-            "gc.wig",
-            "-F",
-            "ref.fa",
-            "-C",
-            "7",
+            "bam2seqz", "-n", "n.bam", "-t", "t.bam", "-gc", "gc.wig", "-F", "ref.fa", "-C", "7",
             "12",
         ])
         .expect("expected parse success");

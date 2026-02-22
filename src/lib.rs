@@ -59,17 +59,7 @@ mod tests {
             .to_string();
 
         let args = parse_args([
-            "bam2seqz",
-            "--pileup",
-            "-n",
-            &normal,
-            "-t",
-            &tumor,
-            "-gc",
-            &gc,
-            "-o",
-            &out,
-            "-f",
+            "bam2seqz", "--pileup", "-n", &normal, "-t", &tumor, "-gc", &gc, "-o", &out, "-f",
             "sanger",
         ])
         .expect("expected valid args");

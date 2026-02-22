@@ -87,16 +87,37 @@ impl WorkerContext {
 
         self.bam_reader
             .fetch((tid, region.start0, region.end0))
-            .map_err(|err| format!("failed BAM fetch for {}:{}-{}: {err}", region.chrom, region.start0 + 1, region.end0))?;
+            .map_err(|err| {
+                format!(
+                    "failed BAM fetch for {}:{}-{}: {err}",
+                    region.chrom,
+                    region.start0 + 1,
+                    region.end0
+                )
+            })?;
 
         self.fasta_reader
             .fetch(&region.chrom, region.start0, region.end0)
-            .map_err(|err| format!("failed FASTA fetch for {}:{}-{}: {err}", region.chrom, region.start0 + 1, region.end0))?;
+            .map_err(|err| {
+                format!(
+                    "failed FASTA fetch for {}:{}-{}: {err}",
+                    region.chrom,
+                    region.start0 + 1,
+                    region.end0
+                )
+            })?;
 
         let mut reference_bases = Vec::new();
         self.fasta_reader
             .read(&mut reference_bases)
-            .map_err(|err| format!("failed FASTA read for {}:{}-{}: {err}", region.chrom, region.start0 + 1, region.end0))?;
+            .map_err(|err| {
+                format!(
+                    "failed FASTA read for {}:{}-{}: {err}",
+                    region.chrom,
+                    region.start0 + 1,
+                    region.end0
+                )
+            })?;
 
         let mut stats = RegionStats::default();
         for pileup_result in self.bam_reader.pileup() {
@@ -141,10 +162,9 @@ impl WorkerContext {
 
                 stats.aligned_bases += 1;
                 stats.quality_sum += u64::from(qual);
-                stats.checksum = stats
-                    .checksum
-                    .wrapping_mul(1_099_511_628_211)
-                    .wrapping_add(u64::from(base) + u64::from(*reference_base) + u64::from(qual) + position0);
+                stats.checksum = stats.checksum.wrapping_mul(1_099_511_628_211).wrapping_add(
+                    u64::from(base) + u64::from(*reference_base) + u64::from(qual) + position0,
+                );
             }
         }
 
@@ -202,24 +222,21 @@ fn main() -> Result<(), String> {
         .map_err(|err| format!("failed to create rayon thread pool: {err}"))?;
 
     pool.install(|| {
-        regions
-            .par_iter()
-            .enumerate()
-            .try_for_each_init(
-                || WorkerContext::new(&args.bam, &args.fasta, args.bam_threads),
-                |context_result, (index, region)| -> Result<(), String> {
-                    let context = match context_result {
-                        Ok(context) => context,
-                        Err(err) => return Err(err.clone()),
-                    };
-                    let stats = context.process_region(region)?;
-                    let mut guard = per_region
-                        .lock()
-                        .map_err(|_| "failed to lock region-stats mutex".to_string())?;
-                    guard[index] = stats;
-                    Ok(())
-                },
-            )
+        regions.par_iter().enumerate().try_for_each_init(
+            || WorkerContext::new(&args.bam, &args.fasta, args.bam_threads),
+            |context_result, (index, region)| -> Result<(), String> {
+                let context = match context_result {
+                    Ok(context) => context,
+                    Err(err) => return Err(err.clone()),
+                };
+                let stats = context.process_region(region)?;
+                let mut guard = per_region
+                    .lock()
+                    .map_err(|_| "failed to lock region-stats mutex".to_string())?;
+                guard[index] = stats;
+                Ok(())
+            },
+        )
     })?;
 
     let combined = per_region

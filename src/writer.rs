@@ -43,9 +43,7 @@ where
         let mut command = Command::new(tools.bgzip());
         command.arg("-c");
         if compression_threads > 1 {
-            command
-                .arg("-@")
-                .arg(compression_threads.to_string());
+            command.arg("-@").arg(compression_threads.to_string());
         }
         command
             .stdin(Stdio::piped())

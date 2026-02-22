@@ -263,7 +263,9 @@ fn rust_matches_golden_parallel_regions() {
 
 #[test]
 fn rust_parallel_single_output_preserves_region_order() {
-    let out = workspace_dir().join("target").join("it_parallel_single.seqz.gz");
+    let out = workspace_dir()
+        .join("target")
+        .join("it_parallel_single.seqz.gz");
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(tabix_index_path(&out));
 
@@ -295,8 +297,8 @@ fn rust_parallel_single_output_preserves_region_order() {
     let actual = gunzip_to_text(&out);
     let expected_a =
         fs::read_to_string(golden_dir().join("bam_parallel_7.seqz")).expect("golden parallel 7");
-    let expected_b = fs::read_to_string(golden_dir().join("bam_parallel_12.seqz"))
-        .expect("golden parallel 12");
+    let expected_b =
+        fs::read_to_string(golden_dir().join("bam_parallel_12.seqz")).expect("golden parallel 12");
     let expected_b_body = expected_b
         .split_once('\n')
         .map(|(_, body)| body)

@@ -179,10 +179,9 @@ impl Bam2SeqzArgs {
                 });
             }
         }
-        let uses_parallel_multi_output =
-            self.nproc > 1
-                && !self.parallel_single_output
-                && (self.pileup || self.has_explicit_ranged_regions());
+        let uses_parallel_multi_output = self.nproc > 1
+            && !self.parallel_single_output
+            && (self.pileup || self.has_explicit_ranged_regions());
 
         if uses_parallel_multi_output && self.out == "-" {
             return Err(AppError::InvalidValue {
