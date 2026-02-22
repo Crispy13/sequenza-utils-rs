@@ -6,6 +6,7 @@ pub mod htslib_mpileup;
 pub mod pipeline;
 pub mod seqz_core;
 pub mod writer;
+pub(crate) mod utils;
 
 use cli::Bam2SeqzArgs;
 use errors::Result;

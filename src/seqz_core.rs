@@ -444,47 +444,20 @@ fn index_to_base(index: usize) -> char {
 }
 
 fn depth_ratio_str(normal_depth: i32, tumor_depth: i32, strip_trailing: bool) -> String {
-    let n = normal_depth as i64;
-    let t = tumor_depth as i64;
-    if n == 0 {
+    if normal_depth == 0 {
         return "0.000".to_string();
     }
 
-    let (q, rem) = ((t * 1000) / n, (t * 1000) % n);
-    let rounded = if strip_trailing {
-        if rem > n / 2 {
-            q + 1
-        } else if rem < n / 2 {
-            q
-        } else if n % 2 == 0 {
-            if q % 2 == 0 {
-                q
-            } else {
-                q + 1
-            }
-        } else {
-            q
-        }
-    } else {
-        (t * 1000 + n / 2) / n
-    };
-
-    let int_part = rounded / 1000;
-    let frac = rounded % 1000;
-    let text = format!("{int_part}.{frac:03}");
+    let ratio = tumor_depth as f64 / normal_depth as f64;
     if strip_trailing {
-        let mut trimmed = text.trim_end_matches('0').to_string();
-        if trimmed.ends_with('.') {
-            trimmed.push('0');
-        }
-        trimmed
+        py_str_round3(ratio)
     } else {
-        text
+        format!("{:.3}", crate::utils::py_round(ratio, 3))
     }
 }
 
 fn py_str_round3(value: f64) -> String {
-    let rounded = (value * 1000.0).round_ties_even() / 1000.0;
+    let rounded = crate::utils::py_round(value, 3);
     if (rounded.fract()).abs() < f64::EPSILON {
         return format!("{rounded:.1}");
     }
@@ -500,7 +473,10 @@ fn py_str_round3(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SeqzInput, SeqzParams, do_seqz, do_seqz_typed, py_str_round3, seqz_header};
+    use super::{
+        SeqzInput, SeqzParams, depth_ratio_str, do_seqz, do_seqz_typed, py_str_round3,
+        seqz_header,
+    };
 
     fn typed_input_from_lines<'a>(
         normal_line: &'a str,
@@ -609,5 +585,19 @@ mod tests {
         assert_eq!(py_str_round3(81.0 / 16.0), "5.062");
         assert_eq!(py_str_round3(89.0 / 16.0), "5.562");
         assert_eq!(py_str_round3(1.0), "1.0");
+    }
+
+    #[test]
+    fn depth_ratio_str_matches_python_rounding_modes() {
+        assert_eq!(depth_ratio_str(16, 77, true), "4.812");
+        assert_eq!(depth_ratio_str(16, 81, true), "5.062");
+        assert_eq!(depth_ratio_str(16, 89, true), "5.562");
+        assert_eq!(depth_ratio_str(16, 16, true), "1.0");
+
+        assert_eq!(depth_ratio_str(16, 77, false), "4.812");
+        assert_eq!(depth_ratio_str(16, 81, false), "5.062");
+        assert_eq!(depth_ratio_str(16, 89, false), "5.562");
+        assert_eq!(depth_ratio_str(3, 1, false), "0.333");
+        assert_eq!(depth_ratio_str(0, 1, false), "0.000");
     }
 }
