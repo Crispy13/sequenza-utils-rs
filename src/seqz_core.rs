@@ -474,8 +474,7 @@ fn py_str_round3(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SeqzInput, SeqzParams, depth_ratio_str, do_seqz, do_seqz_typed, py_str_round3,
-        seqz_header,
+        SeqzInput, SeqzParams, depth_ratio_str, do_seqz, do_seqz_typed, py_str_round3, seqz_header,
     };
 
     fn typed_input_from_lines<'a>(

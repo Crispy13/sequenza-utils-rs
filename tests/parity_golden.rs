@@ -345,20 +345,74 @@ fn rust_parallel_auto_binning_matches_golden_bam_default_single_output() {
 }
 
 #[test]
-fn rust_parallel_auto_binning_contig_duplicates_are_deterministic() {
-    let out_dup = workspace_dir()
+fn rust_parallel_auto_binning_is_deterministic_across_repeated_runs() {
+    let out_a = workspace_dir()
         .join("target")
-        .join("it_parallel_auto_chr20_dup.seqz.gz");
-    let out_single = workspace_dir()
+        .join("it_parallel_auto_repeat_a.seqz.gz");
+    let out_b = workspace_dir()
         .join("target")
-        .join("it_parallel_auto_chr20_single.seqz.gz");
+        .join("it_parallel_auto_repeat_b.seqz.gz");
 
-    for path in [&out_dup, &out_single] {
+    for path in [&out_a, &out_b] {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(tabix_index_path(path));
     }
 
-    let run_dup = run_binary(&[
+    let run_a = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "--parallel",
+        "2",
+        "-o",
+        "target/it_parallel_auto_repeat_a.seqz.gz",
+    ]);
+    assert!(
+        run_a.status.success(),
+        "parallel auto-binning run A failed: {}",
+        String::from_utf8_lossy(&run_a.stderr)
+    );
+
+    let run_b = run_binary(&[
+        "-n",
+        NORMAL_BAM,
+        "-t",
+        TUMOR_BAM,
+        "-gc",
+        GC_WIG,
+        "-F",
+        FASTA,
+        "--parallel",
+        "2",
+        "-o",
+        "target/it_parallel_auto_repeat_b.seqz.gz",
+    ]);
+    assert!(
+        run_b.status.success(),
+        "parallel auto-binning run B failed: {}",
+        String::from_utf8_lossy(&run_b.stderr)
+    );
+
+    assert_output_and_index_exist(&out_a);
+    assert_output_and_index_exist(&out_b);
+
+    assert_eq!(gunzip_to_text(&out_a), gunzip_to_text(&out_b));
+}
+
+#[test]
+fn rust_parallel_auto_binning_with_explicit_whole_chromosome_stays_enabled() {
+    let out = workspace_dir()
+        .join("target")
+        .join("it_parallel_auto_explicit_chr20.seqz.gz");
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(tabix_index_path(&out));
+
+    let run = run_binary(&[
         "-n",
         NORMAL_BAM,
         "-t",
@@ -369,44 +423,28 @@ fn rust_parallel_auto_binning_contig_duplicates_are_deterministic() {
         FASTA,
         "-C",
         "chr20",
-        "chr20",
         "--parallel",
         "2",
         "-o",
-        "target/it_parallel_auto_chr20_dup.seqz.gz",
+        "target/it_parallel_auto_explicit_chr20.seqz.gz",
     ]);
     assert!(
-        run_dup.status.success(),
-        "parallel auto-binning duplicate-contig run failed: {}",
-        String::from_utf8_lossy(&run_dup.stderr)
+        run.status.success(),
+        "parallel explicit-chromosome auto-binning run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
     );
+    assert_output_and_index_exist(&out);
 
-    let run_single = run_binary(&[
-        "-n",
-        NORMAL_BAM,
-        "-t",
-        TUMOR_BAM,
-        "-gc",
-        GC_WIG,
-        "-F",
-        FASTA,
-        "-C",
-        "chr20",
-        "--parallel",
-        "2",
-        "-o",
-        "target/it_parallel_auto_chr20_single.seqz.gz",
-    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
-        run_single.status.success(),
-        "parallel auto-binning single-contig run failed: {}",
-        String::from_utf8_lossy(&run_single.stderr)
+        stderr.contains("running auto-binned parallel mode"),
+        "expected auto-binning marker in stderr, got: {stderr}"
     );
 
-    assert_output_and_index_exist(&out_dup);
-    assert_output_and_index_exist(&out_single);
-
-    assert_eq!(gunzip_to_text(&out_dup), gunzip_to_text(&out_single));
+    let actual = gunzip_to_text(&out);
+    let expected =
+        fs::read_to_string(golden_dir().join("bam_default.seqz")).expect("expected golden text");
+    assert_eq!(actual, expected);
 }
 
 #[test]

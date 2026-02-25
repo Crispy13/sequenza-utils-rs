@@ -2745,6 +2745,10 @@ fn split_ext_like_python(path: &str) -> (String, String) {
 mod tests {
     use crate::cli::parse_args;
     use std::collections::HashSet;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::Builder;
 
     #[test]
     fn build_plan_for_parallel_outputs() {
@@ -2788,6 +2792,190 @@ mod tests {
 
         let plan = super::build_plan(&args).expect("expected plan generation success");
         assert_eq!(plan.qlimit_ascii, 84);
+    }
+
+    #[test]
+    fn auto_binning_enabled_for_implicit_and_explicit_whole_chromosomes() {
+        let no_regions = parse_args([
+            "bam2seqz",
+            "-n",
+            "n.bam",
+            "-t",
+            "t.bam",
+            "-gc",
+            "gc.wig",
+            "-F",
+            "ref.fa",
+            "--parallel",
+            "2",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        assert!(super::should_auto_bin_parallel(&no_regions));
+
+        let explicit_chromosomes = parse_args([
+            "bam2seqz",
+            "-n",
+            "n.bam",
+            "-t",
+            "t.bam",
+            "-gc",
+            "gc.wig",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr1",
+            "chr2",
+            "--parallel",
+            "2",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        assert!(super::should_auto_bin_parallel(&explicit_chromosomes));
+
+        let explicit_ranged_regions = parse_args([
+            "bam2seqz",
+            "-n",
+            "n.bam",
+            "-t",
+            "t.bam",
+            "-gc",
+            "gc.wig",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr1:1-100",
+            "chr2:1-100",
+            "--parallel",
+            "2",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        assert!(!super::should_auto_bin_parallel(&explicit_ranged_regions));
+    }
+
+    #[test]
+    fn auto_bin_derivation_uses_explicit_chromosomes_deduped_and_ordered() {
+        let args = parse_args([
+            "bam2seqz",
+            "-n",
+            "n.bam",
+            "-t",
+            "t.bam",
+            "-gc",
+            "gc.wig",
+            "-F",
+            "ref.fa",
+            "-C",
+            "chr20",
+            "chr20",
+            "chr21",
+            "chr20",
+            "--parallel",
+            "2",
+            "-o",
+            "out.seqz.gz",
+        ])
+        .expect("expected parse success");
+
+        let gc_lines = vec![
+            "variableStep chrom=chr20 span=50".to_string(),
+            "100\t48".to_string(),
+            "variableStep chrom=chr21 span=50".to_string(),
+            "100\t49".to_string(),
+        ];
+        let gc_map = super::parse_gc_intervals(gc_lines);
+        let tools = crate::external_tools::ExternalTools::from_args(&args);
+
+        let derived =
+            super::derive_auto_binned_regions(&args, &tools, &gc_map).expect("derive should work");
+
+        assert_eq!(derived.regions, vec!["chr20:1-500000", "chr21:1-500000"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_bin_derivation_without_explicit_regions_keeps_detected_contigs_order() {
+        let tempdir = Builder::new()
+            .prefix("fake_samtools_idxstats_")
+            .tempdir_in("tmp")
+            .expect("expected temporary script directory");
+        let script_path = tempdir.path().join("samtools_mock.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "idxstats" ]; then
+    cat <<'EOF'
+chr2	1000	10	0
+chrY	1000	10	0
+chrMT	1000	10	0
+GL000191.1	1000	10	0
+*	0	0	10
+EOF
+    exit 0
+fi
+exit 1
+"#,
+        )
+        .expect("expected fake samtools script write success");
+
+        let mut permissions = fs::metadata(&script_path)
+            .expect("expected script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("expected chmod success");
+
+        let script_path = script_path.to_string_lossy().to_string();
+        let args = parse_args(vec![
+            "bam2seqz".to_string(),
+            "-n".to_string(),
+            "n.bam".to_string(),
+            "-t".to_string(),
+            "t.bam".to_string(),
+            "-gc".to_string(),
+            "gc.wig".to_string(),
+            "-F".to_string(),
+            "ref.fa".to_string(),
+            "--parallel".to_string(),
+            "2".to_string(),
+            "-S".to_string(),
+            script_path,
+            "-o".to_string(),
+            "out.seqz.gz".to_string(),
+        ])
+        .expect("expected parse success");
+
+        let gc_lines = vec![
+            "variableStep chrom=chr2 span=50".to_string(),
+            "100\t48".to_string(),
+            "variableStep chrom=chrY span=50".to_string(),
+            "100\t41".to_string(),
+            "variableStep chrom=chrMT span=50".to_string(),
+            "100\t39".to_string(),
+            "variableStep chrom=GL000191.1 span=50".to_string(),
+            "100\t37".to_string(),
+        ];
+        let gc_map = super::parse_gc_intervals(gc_lines);
+        let tools = crate::external_tools::ExternalTools::from_args(&args);
+
+        let derived =
+            super::derive_auto_binned_regions(&args, &tools, &gc_map).expect("derive should work");
+
+        assert_eq!(
+            derived.regions,
+            vec![
+                "chr2:1-500000".to_string(),
+                "chrY:1-500000".to_string(),
+                "chrMT:1-500000".to_string(),
+                "GL000191.1:1-500000".to_string(),
+            ]
+        );
     }
 
     #[test]
