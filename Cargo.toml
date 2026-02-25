@@ -1,6 +1,6 @@
 [package]
 name = "sequenza-utils"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 default-run = "bam2seqz"
 autobins = false

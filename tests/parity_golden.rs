@@ -405,7 +405,7 @@ fn rust_parallel_auto_binning_is_deterministic_across_repeated_runs() {
 }
 
 #[test]
-fn rust_parallel_auto_binning_with_explicit_whole_chromosome_stays_enabled() {
+fn rust_parallel_explicit_whole_chromosome_uses_ordered_single_output_without_auto_binning() {
     let out = workspace_dir()
         .join("target")
         .join("it_parallel_auto_explicit_chr20.seqz.gz");
@@ -437,8 +437,8 @@ fn rust_parallel_auto_binning_with_explicit_whole_chromosome_stays_enabled() {
 
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
-        stderr.contains("running auto-binned parallel mode"),
-        "expected auto-binning marker in stderr, got: {stderr}"
+        !stderr.contains("running auto-binned parallel mode"),
+        "did not expect auto-binning marker in stderr, got: {stderr}"
     );
 
     let actual = gunzip_to_text(&out);

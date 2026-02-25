@@ -118,7 +118,17 @@ pub fn run(args: &Bam2SeqzArgs) -> Result<()> {
             return run_parallel_single_output(args, gc_intervals, auto_regions.regions);
         }
 
-        if args.parallel_single_output {
+        let use_chromosome_scoped_single_output =
+            should_use_chromosome_scoped_parallel_single_output(args);
+
+        if args.parallel_single_output || use_chromosome_scoped_single_output {
+            if use_chromosome_scoped_single_output {
+                info!(
+                    chromosomes = args.chr.len(),
+                    "running chromosome-scoped parallel mode with ordered single output"
+                );
+            }
+
             let effective_regions = if args.chr.is_empty() {
                 Vec::new()
             } else {
@@ -930,7 +940,11 @@ fn run_one_with_htslib_context_body_to_buffer(
 }
 
 fn should_auto_bin_parallel(args: &Bam2SeqzArgs) -> bool {
-    args.nproc > 1 && !args.pileup && !args.has_explicit_ranged_regions()
+    args.nproc > 1 && !args.pileup && args.chr.is_empty() && !args.has_explicit_ranged_regions()
+}
+
+fn should_use_chromosome_scoped_parallel_single_output(args: &Bam2SeqzArgs) -> bool {
+    args.nproc > 1 && !args.pileup && !args.chr.is_empty() && !args.has_explicit_ranged_regions()
 }
 
 fn derive_auto_binned_regions(
@@ -2795,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_binning_enabled_for_implicit_and_explicit_whole_chromosomes() {
+    fn auto_binning_enabled_only_without_explicit_chromosomes() {
         let no_regions = parse_args([
             "bam2seqz",
             "-n",
@@ -2814,6 +2828,9 @@ mod tests {
         .expect("expected parse success");
 
         assert!(super::should_auto_bin_parallel(&no_regions));
+        assert!(!super::should_use_chromosome_scoped_parallel_single_output(
+            &no_regions
+        ));
 
         let explicit_chromosomes = parse_args([
             "bam2seqz",
@@ -2835,7 +2852,10 @@ mod tests {
         ])
         .expect("expected parse success");
 
-        assert!(super::should_auto_bin_parallel(&explicit_chromosomes));
+        assert!(!super::should_auto_bin_parallel(&explicit_chromosomes));
+        assert!(super::should_use_chromosome_scoped_parallel_single_output(
+            &explicit_chromosomes
+        ));
 
         let explicit_ranged_regions = parse_args([
             "bam2seqz",
@@ -2858,6 +2878,9 @@ mod tests {
         .expect("expected parse success");
 
         assert!(!super::should_auto_bin_parallel(&explicit_ranged_regions));
+        assert!(!super::should_use_chromosome_scoped_parallel_single_output(
+            &explicit_ranged_regions
+        ));
     }
 
     #[test]
