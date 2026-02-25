@@ -940,11 +940,15 @@ fn run_one_with_htslib_context_body_to_buffer(
 }
 
 fn should_auto_bin_parallel(args: &Bam2SeqzArgs) -> bool {
-    args.nproc > 1 && !args.pileup && args.chr.is_empty() && !args.has_explicit_ranged_regions()
+    args.nproc > 1 && !args.pileup && !args.has_explicit_ranged_regions()
 }
 
 fn should_use_chromosome_scoped_parallel_single_output(args: &Bam2SeqzArgs) -> bool {
-    args.nproc > 1 && !args.pileup && !args.chr.is_empty() && !args.has_explicit_ranged_regions()
+    args.nproc > 1
+        && !args.pileup
+        && !args.chr.is_empty()
+        && !args.has_explicit_ranged_regions()
+        && !should_auto_bin_parallel(args)
 }
 
 fn derive_auto_binned_regions(
@@ -2809,7 +2813,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_binning_enabled_only_without_explicit_chromosomes() {
+    fn auto_binning_enabled_for_parallel_non_ranged_regions() {
         let no_regions = parse_args([
             "bam2seqz",
             "-n",
@@ -2852,8 +2856,8 @@ mod tests {
         ])
         .expect("expected parse success");
 
-        assert!(!super::should_auto_bin_parallel(&explicit_chromosomes));
-        assert!(super::should_use_chromosome_scoped_parallel_single_output(
+        assert!(super::should_auto_bin_parallel(&explicit_chromosomes));
+        assert!(!super::should_use_chromosome_scoped_parallel_single_output(
             &explicit_chromosomes
         ));
 
